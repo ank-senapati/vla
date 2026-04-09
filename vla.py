@@ -27,11 +27,14 @@ def _traj_record(sim, joints):
     global _TRAJ_T0
     if _TRAJ_T0 is None:
         _TRAJ_T0 = time.time()
-    TRAJECTORY.append({
-        "phase": _TRAJ_PHASE,
-        "t": time.time() - _TRAJ_T0,
-        "q": [float(sim.getJointPosition(j)) for j in joints],
-    })
+    TRAJECTORY.append(
+        {
+            "phase": _TRAJ_PHASE,
+            "t": time.time() - _TRAJ_T0,
+            "q": [float(sim.getJointPosition(j)) for j in joints],
+        }
+    )
+
 
 # ─────────────────────────── Constants ────────────────────────
 RES_X, RES_Y = 512, 512
@@ -170,6 +173,7 @@ def setup_vla_environment(sim):
     tip_dummy = sim.createDummy(0.01)
     sim.setObjectParent(tip_dummy, tip_handle, False)
     sim.setObjectPosition(tip_dummy, tip_handle, [0, 0, 0])
+    sim.setObjectInt32Param(tip_dummy, sim.objintparam_visibility_layer, 0)
 
     ik_target = sim.createDummy(0.05)
     # Copy the tip_dummy's ACTUAL world pose (pos + ori) into the IK target
@@ -177,13 +181,16 @@ def setup_vla_environment(sim):
     # startup. This prevents the arm from visibly snapping when the solver
     # first runs to "correct" a mismatch that shouldn't exist.
     sim.setObjectPosition(
-        ik_target, sim.handle_world,
+        ik_target,
+        sim.handle_world,
         sim.getObjectPosition(tip_dummy, sim.handle_world),
     )
     sim.setObjectOrientation(
-        ik_target, sim.handle_world,
+        ik_target,
+        sim.handle_world,
         sim.getObjectOrientation(tip_dummy, sim.handle_world),
     )
+    sim.setObjectInt32Param(ik_target, sim.objintparam_visibility_layer, 0)
 
     # Overhead camera
     sensor = sim.createVisionSensor(
@@ -334,8 +341,9 @@ def _lerp(a, b, t):
     return [a[i] + (b[i] - a[i]) * t for i in range(3)]
 
 
-def smooth_joint_move(sim, joints, target_config, steps=60, dt=0.02,
-                      ik_target=None, tip_dummy=None):
+def smooth_joint_move(
+    sim, joints, target_config, steps=60, dt=0.02, ik_target=None, tip_dummy=None
+):
     """
     Smoothly interpolate the arm from its current joint config to target_config
     without any IK snapping. Uses a smoothstep ease so start and end are gentle.
@@ -361,7 +369,7 @@ def smooth_joint_move(sim, joints, target_config, steps=60, dt=0.02,
 
 def _get_arm_lowest_z(sim, joints):
     """Return the lowest Z coordinate of any joint in the arm."""
-    min_z = float('inf')
+    min_z = float("inf")
     for j in joints:
         pos = sim.getObjectPosition(j, sim.handle_world)
         if pos[2] < min_z:
@@ -403,13 +411,21 @@ def _normalize_angle_close(target, ref):
 
 def _normalize_config_close(target, current):
     """Elementwise shortest-angular-path normalization of a joint config."""
-    return [_normalize_angle_close(target[i], current[i])
-            for i in range(len(current))]
+    return [_normalize_angle_close(target[i], current[i]) for i in range(len(current))]
 
 
-def compute_ik_config_silently(sim, simIK, ik_env, ik_group, joints, ik_target,
-                                target_pos, target_ori=None, iters=8,
-                                ur5_base=None):
+def compute_ik_config_silently(
+    sim,
+    simIK,
+    ik_env,
+    ik_group,
+    joints,
+    ik_target,
+    target_pos,
+    target_ori=None,
+    iters=8,
+    ur5_base=None,
+):
     """
     Compute the joint config that reaches target_pos, WITHOUT leaving the
     simulation in a visibly different state. Saves current joint state,
@@ -444,16 +460,14 @@ def compute_ik_config_silently(sim, simIK, ik_env, ik_group, joints, ik_target,
                         layer = sim.getObjectInt32Param(
                             o, sim.objintparam_visibility_layer
                         )
-                        sim.setObjectInt32Param(
-                            o, sim.objintparam_visibility_layer, 0
-                        )
+                        sim.setObjectInt32Param(o, sim.objintparam_visibility_layer, 0)
                         hidden_shapes.append((o, layer))
                 except Exception:
                     pass
         except Exception:
             pass
 
-    lowest_z = float('inf')
+    lowest_z = float("inf")
     try:
         # Seed the joints in an elbow-up config facing target
         seed_elbow_up(sim, joints, target_pos)
@@ -477,15 +491,14 @@ def compute_ik_config_silently(sim, simIK, ik_env, ik_group, joints, ik_target,
         # Restore visibility layers
         for o, layer in hidden_shapes:
             try:
-                sim.setObjectInt32Param(
-                    o, sim.objintparam_visibility_layer, layer
-                )
+                sim.setObjectInt32Param(o, sim.objintparam_visibility_layer, layer)
             except Exception:
                 pass
 
     # Normalize each joint angle to the shortest path from the saved state
-    normalized = [_normalize_angle_close(goal[i], saved_joints[i])
-                  for i in range(len(joints))]
+    normalized = [
+        _normalize_angle_close(goal[i], saved_joints[i]) for i in range(len(joints))
+    ]
     return normalized, lowest_z
 
 
@@ -511,8 +524,9 @@ def move_joints_smooth(sim, joints, target_config, steps=150, delay=0.012):
         time.sleep(delay)
 
 
-def move_ik_to(sim, simIK, ik_env, ik_group, ik_target, dest, steps,
-               min_z=None, joints=None):
+def move_ik_to(
+    sim, simIK, ik_env, ik_group, ik_target, dest, steps, min_z=None, joints=None
+):
     start = list(sim.getObjectPosition(ik_target, sim.handle_world))
     for i in range(1, steps + 1):
         p = _lerp(start, dest, i / steps)
@@ -555,11 +569,19 @@ def plan_and_execute_ompl(
     # for the few ms the solve takes, so no flicker can leak through.
     print("   [OMPL] Solving IK for goal config (silent)...")
     goal_config, lowest_after_ik = compute_ik_config_silently(
-        sim, simIK, ik_env, ik_group, joints, ik_target, goal_pos,
+        sim,
+        simIK,
+        ik_env,
+        ik_group,
+        joints,
+        ik_target,
+        goal_pos,
         ur5_base=ur5_base,
     )
     if lowest_after_ik < MIN_JOINT_Z:
-        print(f"   [OMPL] IK landed with lowest joint z={lowest_after_ik:.3f}. Aborting OMPL.")
+        print(
+            f"   [OMPL] IK landed with lowest joint z={lowest_after_ik:.3f}. Aborting OMPL."
+        )
         return False
     # Joints are already back at start_config (silent helper restored them)
 
@@ -577,7 +599,7 @@ def plan_and_execute_ompl(
     if goal_pos[1] < -0.05:
         forced_direction[2] = "ccw"  # blue
     else:
-        forced_direction[2] = "cw"   # red, green
+        forced_direction[2] = "cw"  # red, green
 
     for _idx, _dir in forced_direction.items():
         d = goal_config[_idx] - start_config[_idx]
@@ -591,9 +613,11 @@ def plan_and_execute_ompl(
         elif _dir == "cw" and d > 0.0:
             d -= 2.0 * math.pi
         goal_config[_idx] = start_config[_idx] + d
-        print(f"   [OMPL] Forcing joint {_idx} {_dir.upper()}: "
-              f"start={start_config[_idx]:.3f} goal={goal_config[_idx]:.3f} "
-              f"(delta={d:+.3f} rad)")
+        print(
+            f"   [OMPL] Forcing joint {_idx} {_dir.upper()}: "
+            f"start={start_config[_idx]:.3f} goal={goal_config[_idx]:.3f} "
+            f"(delta={d:+.3f} rad)"
+        )
 
     # Create OMPL task
     task = simOMPL.createTask("pick_task")
@@ -698,21 +722,21 @@ def plan_and_execute_ompl(
         state = [float(path_states[i * n_joints + k]) for k in range(n_joints)]
         if waypoints:
             prev = waypoints[-1]
-            state = [_unwrap_joint(k, state[k], prev[k])
-                     for k in range(n_joints)]
+            state = [_unwrap_joint(k, state[k], prev[k]) for k in range(n_joints)]
         waypoints.append(state)
 
     # Make sure the first waypoint exactly matches the current joint state
     # so we never see a jump from the starting pose into waypoint[0].
     current_q = [float(sim.getJointPosition(j)) for j in joints]
-    waypoints[0] = [_unwrap_joint(k, waypoints[0][k], current_q[k])
-                    for k in range(n_joints)]
+    waypoints[0] = [
+        _unwrap_joint(k, waypoints[0][k], current_q[k]) for k in range(n_joints)
+    ]
 
     # Sub-step count per segment: picked so even a big joint-space jump gets
     # broken into small increments (≤ ~3° per sub-step).
     SUB_MIN = 8
     SUB_PER_RAD = 20  # ~3° per sub-step
-    DT = 0.012        # wall time per sub-step
+    DT = 0.012  # wall time per sub-step
     for seg in range(len(waypoints) - 1):
         a = waypoints[seg]
         b = waypoints[seg + 1]
@@ -764,7 +788,7 @@ def pick_block(
     # For the blue block, insert a higher intermediate "high approach"
     # waypoint so the arm rises before translating to the above-block pose,
     # giving more clearance on the way in.
-    use_high_approach = (target_color == "blue")
+    use_high_approach = target_color == "blue"
     HIGH_APPROACH_Z = 0.60  # higher than SAFE_Z (0.35)
 
     print(
@@ -828,8 +852,7 @@ def pick_block(
 
     _traj_set_phase("ik_phase3_descend_to_block")
     print(f"   Phase 3: Descend (Z → {touch_z:.3f})")
-    move_ik_to(sim, simIK, ik_env, ik_group, ik_target, touch_pos, 40,
-               joints=joints)
+    move_ik_to(sim, simIK, ik_env, ik_group, ik_target, touch_pos, 40, joints=joints)
 
     # Report actual distance
     final_tip = sim.getObjectPosition(tip_dummy, sim.handle_world)
@@ -849,9 +872,14 @@ def pick_block(
     print("   Lift with block (straight up)")
     resync_ik_target(sim, simIK, ik_env, ik_group, ik_target, tip_dummy)
     move_ik_to(
-        sim, simIK, ik_env, ik_group, ik_target,
+        sim,
+        simIK,
+        ik_env,
+        ik_group,
+        ik_target,
         [world_pos[0], world_pos[1], SAFE_Z],
-        40, joints=joints,
+        40,
+        joints=joints,
     )
 
     # 2) Rotate base (joint[0]) by -90° — clockwise when viewed from above.
@@ -902,8 +930,12 @@ def main(task="I need to tighten a screw.", force_color=None):
         ik_env, ik_group, simIK.method_damped_least_squares, 0.1, 99
     )
     simIK.addElementFromScene(
-        ik_env, ik_group, ur5, tip_dummy, ik_target,
-        simIK.constraint_position + simIK.constraint_orientation
+        ik_env,
+        ik_group,
+        ur5,
+        tip_dummy,
+        ik_target,
+        simIK.constraint_position + simIK.constraint_orientation,
     )
 
     sim.startSimulation()
@@ -930,9 +962,13 @@ def main(task="I need to tighten a screw.", force_color=None):
         0.0,
     ]
     smooth_joint_move(
-        sim, joints, ready_config,
-        steps=60, dt=0.02,
-        ik_target=ik_target, tip_dummy=tip_dummy,
+        sim,
+        joints,
+        ready_config,
+        steps=60,
+        dt=0.02,
+        ik_target=ik_target,
+        tip_dummy=tip_dummy,
     )
 
     # Final resync, then a couple of IK iterations so the solver state is
@@ -1084,13 +1120,13 @@ if __name__ == "__main__":
         type=str,
         default="I need to tighten a screw.",
         help="Natural-language command passed to the VLM "
-             "(e.g. 'I need to drive a nail.').",
+        "(e.g. 'I need to drive a nail.').",
     )
     task_group.add_argument(
         "--color",
         choices=["red", "green", "blue"],
         help="Shortcut that picks a canned task for the given block color: "
-             "red=drive a nail, green=tighten a screw, blue=loosen a bolt.",
+        "red=drive a nail, green=tighten a screw, blue=loosen a bolt.",
     )
     args = parser.parse_args()
 

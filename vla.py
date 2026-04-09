@@ -16,6 +16,9 @@ from coppeliasim_zmqremoteapi_client import RemoteAPIClient
 TRAJECTORY = []
 _TRAJ_T0 = None
 _TRAJ_PHASE = "init"
+_SIDE_VIDEO_WRITER = None
+_SIDE_VIDEO_SENSOR = None
+_SIDE_VIDEO_PATH = None
 
 
 def _traj_set_phase(name):
@@ -49,6 +52,47 @@ MIN_JOINT_Z = 0.05  # no part of the arm should go below 5 cm
 
 CAM_POS = [0.35, 0.0, 2.2]
 CAM_ORI = [math.pi, 0, 0]
+# Oblique 3/4 "default viewport" style camera (roughly 45° around scene)
+SIDE_CAM_POS = [1.05, -0.85, 0.85]
+SIDE_CAM_ORI = [2.3, 0.0, 2.35]
+SIDE_CAM_LOOK_AT = [0.35, 0.0, 0.2]
+
+
+def _side_video_start(sim, sensor, filename="side_view.mp4", fps=30):
+    global _SIDE_VIDEO_WRITER, _SIDE_VIDEO_SENSOR, _SIDE_VIDEO_PATH
+    fourcc = cv2.VideoWriter_fourcc(*"mp4v")
+    writer = cv2.VideoWriter(filename, fourcc, float(fps), (RES_X, RES_Y))
+    if not writer.isOpened():
+        print(f"   WARNING: could not open video writer for {filename}")
+        return
+    _SIDE_VIDEO_WRITER = writer
+    _SIDE_VIDEO_SENSOR = sensor
+    _SIDE_VIDEO_PATH = filename
+    print(f"   Recording side video → {filename}")
+
+
+def _side_video_tick(sim):
+    if _SIDE_VIDEO_WRITER is None or _SIDE_VIDEO_SENSOR is None:
+        return
+    try:
+        img, res = sim.getVisionSensorImg(_SIDE_VIDEO_SENSOR)
+        if img:
+            arr = np.frombuffer(img, dtype=np.uint8).reshape((res[1], res[0], 3))
+            arr = cv2.flip(arr, 0)
+            frame_bgr = cv2.cvtColor(arr, cv2.COLOR_RGB2BGR)
+            _SIDE_VIDEO_WRITER.write(frame_bgr)
+    except Exception:
+        pass
+
+
+def _side_video_stop():
+    global _SIDE_VIDEO_WRITER, _SIDE_VIDEO_SENSOR, _SIDE_VIDEO_PATH
+    if _SIDE_VIDEO_WRITER is not None:
+        _SIDE_VIDEO_WRITER.release()
+        print(f"   Saved side video: {_SIDE_VIDEO_PATH}")
+    _SIDE_VIDEO_WRITER = None
+    _SIDE_VIDEO_SENSOR = None
+    _SIDE_VIDEO_PATH = None
 
 
 # ─────────────────────────── Scene Setup ──────────────────────
@@ -204,6 +248,59 @@ def setup_vla_environment(sim):
     sim.setObjectInt32Param(sensor, sim.objintparam_visibility_layer, 0)
 
     return ik_target, tip_dummy, ur5_base, sensor, tools, joints, floor_h
+
+
+def create_side_camera(sim):
+    def _normalize(v):
+        n = float(np.linalg.norm(v))
+        if n < 1e-9:
+            return None
+        return v / n
+
+    def _orient_sensor_look_at(sensor_handle, cam_pos, target_pos):
+        p = np.array(cam_pos, dtype=float)
+        t = np.array(target_pos, dtype=float)
+        z_axis = _normalize(t - p)
+        if z_axis is None:
+            return
+
+        up = np.array([0.0, 0.0, 1.0], dtype=float)
+        if abs(float(np.dot(z_axis, up))) > 0.98:
+            up = np.array([0.0, 1.0, 0.0], dtype=float)
+
+        x_axis = _normalize(np.cross(up, z_axis))
+        if x_axis is None:
+            return
+        y_axis = _normalize(np.cross(z_axis, x_axis))
+        if y_axis is None:
+            return
+
+        # CoppeliaSim 3x4 matrix: columns are object X/Y/Z axes in world.
+        m = [
+            float(x_axis[0]),
+            float(y_axis[0]),
+            float(z_axis[0]),
+            float(p[0]),
+            float(x_axis[1]),
+            float(y_axis[1]),
+            float(z_axis[1]),
+            float(p[1]),
+            float(x_axis[2]),
+            float(y_axis[2]),
+            float(z_axis[2]),
+            float(p[2]),
+        ]
+        sim.setObjectMatrix(sensor_handle, sim.handle_world, m)
+
+    sensor = sim.createVisionSensor(
+        0,
+        [RES_X, RES_Y, 0, 0],
+        [NEAR_CLIP, FAR_CLIP, FOV_DEG * math.pi / 180, 0.1, 0, 0, 0, 0, 0, 0, 0],
+    )
+    sim.setObjectParent(sensor, sim.handle_world, False)
+    sim.setObjectPosition(sensor, sim.handle_world, SIDE_CAM_POS)
+    _orient_sensor_look_at(sensor, SIDE_CAM_POS, SIDE_CAM_LOOK_AT)
+    return sensor
 
 
 # ─────────────────────────── Vision ───────────────────────────
@@ -364,6 +461,7 @@ def smooth_joint_move(
             to = sim.getObjectOrientation(tip_dummy, sim.handle_world)
             sim.setObjectPosition(ik_target, sim.handle_world, tp)
             sim.setObjectOrientation(ik_target, sim.handle_world, to)
+            _side_video_tick(sim)
         time.sleep(dt)
 
 
@@ -520,6 +618,7 @@ def move_joints_smooth(sim, joints, target_config, steps=150, delay=0.012):
         u = _ease_in_out(i / steps)
         for j_idx, j_handle in enumerate(joints):
             sim.setJointPosition(j_handle, start[j_idx] + deltas[j_idx] * u)
+        _side_video_tick(sim)
         _traj_record(sim, joints)
         time.sleep(delay)
 
@@ -534,6 +633,7 @@ def move_ik_to(
             p[2] = max(p[2], min_z)
         sim.setObjectPosition(ik_target, sim.handle_world, p)
         sync_ik(sim, simIK, ik_env, ik_group, n=2)
+        _side_video_tick(sim)
         if joints is not None:
             _traj_record(sim, joints)
         time.sleep(0.015)
@@ -747,6 +847,7 @@ def plan_and_execute_ompl(
             for j_idx, j_handle in enumerate(joints):
                 val = a[j_idx] + (b[j_idx] - a[j_idx]) * u
                 sim.setJointPosition(j_handle, val)
+            _side_video_tick(sim)
             # NOTE: no sync_ik here — IK would fight the OMPL-chosen joint
             # values. We drive joints directly, which is exactly what OMPL
             # planned.
@@ -895,7 +996,8 @@ def pick_block(
 
 
 # ─────────────────────────── Main ─────────────────────────────
-def main(task="I need to tighten a screw.", force_color=None):
+def main(task="I need to tighten a screw.", force_color=None,
+         record_side_video=False, side_video_file="side_view.mp4"):
     client = RemoteAPIClient()
     sim = client.require("sim")
     simIK = client.require("simIK")
@@ -915,6 +1017,9 @@ def main(task="I need to tighten a screw.", force_color=None):
     if not result:
         return
     ik_target, tip_dummy, ur5, sensor, tools, joints, floor_h = result
+    side_sensor = None
+    if record_side_video:
+        side_sensor = create_side_camera(sim)
 
     # Known positions for validation only (NOT used for targeting)
     known_positions = {
@@ -940,6 +1045,9 @@ def main(task="I need to tighten a screw.", force_color=None):
 
     sim.startSimulation()
     time.sleep(0.3)  # let the sim render the loaded-default pose once
+    if record_side_video and side_sensor is not None:
+        _side_video_start(sim, side_sensor, filename=side_video_file, fps=30)
+        _side_video_tick(sim)
 
     # BEFORE moving anything, sync the IK target to the current (loaded) tip
     # pose so the position+orientation IK constraint has nothing to correct.
@@ -989,6 +1097,8 @@ def main(task="I need to tighten a screw.", force_color=None):
     img_bgr = run_vision(sim, sensor, "robot_view.jpg")
     if img_bgr is None:
         print("ERROR: no image!")
+        if record_side_video:
+            _side_video_stop()
         return
 
     # ── Validate deprojection on all blocks ──
@@ -1023,6 +1133,8 @@ def main(task="I need to tighten a screw.", force_color=None):
             print(f"   LLaVA: '{vlm_reply}'")
         except Exception as e:
             print(f"   Ollama error: {e}")
+            if record_side_video:
+                _side_video_stop()
             return
 
     # Parse LLaVA's reply robustly. The prompt asks for a single word, but
@@ -1047,6 +1159,8 @@ def main(task="I need to tighten a screw.", force_color=None):
             target_color = top[-1]
     if not target_color:
         print("   Could not parse colour.")
+        if record_side_video:
+            _side_video_stop()
         return
 
     # ── OpenCV: find the block in the image ──
@@ -1054,6 +1168,8 @@ def main(task="I need to tighten a screw.", force_color=None):
     pix = get_object_pixel(img_bgr, target_color)
     if not pix:
         print("   Block not found in image!")
+        if record_side_video:
+            _side_video_stop()
         return
     print(f"   Detected at pixel ({pix[0]}, {pix[1]})")
     cv2.imwrite("vision_debug.jpg", img_bgr)
@@ -1107,6 +1223,9 @@ def main(task="I need to tighten a screw.", force_color=None):
         json.dump(traj_out, f, indent=2)
     print(f"\n   Wrote trajectory.json ({len(TRAJECTORY)} samples)")
 
+    if record_side_video:
+        _side_video_stop()
+
     time.sleep(2)
     sim.stopSimulation()
     print("\nPIPELINE COMPLETE.")
@@ -1128,6 +1247,17 @@ if __name__ == "__main__":
         help="Shortcut that picks a canned task for the given block color: "
         "red=drive a nail, green=tighten a screw, blue=loosen a bolt.",
     )
+    parser.add_argument(
+        "--record-side-video",
+        action="store_true",
+        help="Record a side-view MP4 of the robot motion.",
+    )
+    parser.add_argument(
+        "--side-video-file",
+        type=str,
+        default="side_view.mp4",
+        help="Output filename for side-view recording when --record-side-video is set.",
+    )
     args = parser.parse_args()
 
     if args.color:
@@ -1139,6 +1269,15 @@ if __name__ == "__main__":
             "green": "I need to tighten a screw.",
             "blue": "I need to loosen a bolt.",
         }[args.color]
-        main(task=task, force_color=args.color)
+        main(
+            task=task,
+            force_color=args.color,
+            record_side_video=args.record_side_video,
+            side_video_file=args.side_video_file,
+        )
     else:
-        main(task=args.task)
+        main(
+            task=args.task,
+            record_side_video=args.record_side_video,
+            side_video_file=args.side_video_file,
+        )

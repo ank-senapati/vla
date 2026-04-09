@@ -1,0 +1,47 @@
+[1/7] Purging the scene...
+[2/7] Spawning UR5 + workspace...
+
+=== SENSOR ACTUAL FOV: 60.00° (we set 70°)
+=== f_pix (corrected): 886.8
+=== f_pix (old wrong):  443.4
+
+=== DEPROJECTION TEST (all 3 blocks) ===
+   Capturing: diag_top.jpg
+
+   --- red block ---
+   Pixel: (214, 318)
+
+   [Deproject] pixel (214, 318)
+   depth_norm=0.213213  z_cam=2.1400 m
+   sensor FOV=60.0°  f_pix=886.8
+   camera-frame: (0.1001, -0.1508, 2.1400)
+   world: (0.4501, 0.1508, 0.0600)
+   TRUE:       (0.4500, 0.1500, 0.0300)
+   DEPROJECTED: (0.4501, 0.1508, 0.0600)
+   XY ERROR: 0.1 cm
+
+   --- green block ---
+   Pixel: (214, 256)
+
+   [Deproject] pixel (214, 256)
+   depth_norm=0.213213  z_cam=2.1400 m
+   sensor FOV=60.0°  f_pix=886.8
+   camera-frame: (0.1001, -0.0012, 2.1400)
+   world: (0.4501, 0.0012, 0.0600)
+   TRUE:       (0.4500, 0.0000, 0.0300)
+   DEPROJECTED: (0.4501, 0.0012, 0.0600)
+   XY ERROR: 0.1 cm
+
+   --- blue block ---
+   Pixel: (403, 256)
+
+   [Deproject] pixel (403, 256)
+   depth_norm=0.185560  z_cam=1.8637 m
+   sensor FOV=60.0°  f_pix=886.8
+   camera-frame: (-0.3100, -0.0011, 1.8637)
+   world: (0.0400, 0.0011, 0.3363)
+   TRUE:       (0.4500, -0.1500, 0.0300)
+   DEPROJECTED: (0.0400, 0.0011, 0.3363)
+   XY ERROR: 43.7 cm
+
+DIAGNOSTIC COMPLETE.

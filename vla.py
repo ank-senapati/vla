@@ -523,6 +523,7 @@ def compute_ik_config_silently(
     target_ori=None,
     iters=8,
     ur5_base=None,
+    flip_elbow=False,
 ):
     """
     Compute the joint config that reaches target_pos, WITHOUT leaving the
@@ -569,6 +570,12 @@ def compute_ik_config_silently(
     try:
         # Seed the joints in an elbow-up config facing target
         seed_elbow_up(sim, joints, target_pos)
+        # Optional: flip the elbow seed to the opposite branch. Used only on
+        # the first approach to the toolbox so the arm comes in from the
+        # other side. seed_elbow_up puts joint[2] at 315° (= -45°); the
+        # opposite branch is +45°.
+        if flip_elbow:
+            sim.setJointPosition(joints[2], math.radians(45))
         sim.setObjectPosition(ik_target, sim.handle_world, target_pos)
         sim.setObjectOrientation(ik_target, sim.handle_world, target_ori)
         # A handful of fast IK iterations — DLS converges in ~5 passes for
@@ -653,6 +660,7 @@ def plan_and_execute_ompl(
     start_config,
     goal_pos,
     floor_handle=None,
+    flip_elbow=False,
 ):
     """
     Plan collision-free joint-space path via OMPL RRTConnect:
@@ -668,6 +676,8 @@ def plan_and_execute_ompl(
     # Passing ur5_base lets the helper hide the arm on the visibility layer
     # for the few ms the solve takes, so no flicker can leak through.
     print("   [OMPL] Solving IK for goal config (silent)...")
+    if flip_elbow:
+        print("   [OMPL] Elbow flipped for first-approach toolbox grab.")
     goal_config, lowest_after_ik = compute_ik_config_silently(
         sim,
         simIK,
@@ -677,6 +687,7 @@ def plan_and_execute_ompl(
         ik_target,
         goal_pos,
         ur5_base=ur5_base,
+        flip_elbow=flip_elbow,
     )
     if lowest_after_ik < MIN_JOINT_Z:
         print(
@@ -784,8 +795,49 @@ def plan_and_execute_ompl(
     simOMPL.setGoalState(task, goal_config)
     simOMPL.setup(task)
 
+    # CoppeliaSim's simOMPL plugin validates the goal (and several sampled
+    # states during planning) by writing those joint configs into the LIVE
+    # scene joints, checking collisions, and NOT restoring afterward. The
+    # net result is that compute() leaves the visible arm sitting at the
+    # goal config — and then our execution loop snaps it back to start_config
+    # for waypoint[0], producing the visible "flash to final → return →
+    # smooth move" glitch.
+    #
+    # Mitigation: hide the UR5 on the visibility layer for the duration of
+    # setup + compute, snap joints back to start_config the instant compute
+    # returns, then unhide. The renderer never sees the OMPL-internal poses.
+    ompl_hidden_shapes = []
+    try:
+        subtree = sim.getObjectsInTree(ur5_base, sim.handle_all, 0)
+        for o in subtree:
+            try:
+                if sim.getObjectType(o) == sim.object_shape_type:
+                    layer = sim.getObjectInt32Param(
+                        o, sim.objintparam_visibility_layer
+                    )
+                    sim.setObjectInt32Param(o, sim.objintparam_visibility_layer, 0)
+                    ompl_hidden_shapes.append((o, layer))
+            except Exception:
+                pass
+    except Exception:
+        pass
+
     print("   [OMPL] Computing path (up to 5s)...")
-    solved, path_states = simOMPL.compute(task, 5.0, -1, 80)
+    try:
+        solved, path_states = simOMPL.compute(task, 5.0, -1, 80)
+    finally:
+        # Snap joints back to start_config BEFORE restoring visibility, so
+        # the very first frame painted after unhide shows the start pose,
+        # not whatever OMPL left behind.
+        for j_idx, j_handle in enumerate(joints):
+            sim.setJointPosition(j_handle, float(start_config[j_idx]))
+        for o, layer in ompl_hidden_shapes:
+            try:
+                sim.setObjectInt32Param(
+                    o, sim.objintparam_visibility_layer, layer
+                )
+            except Exception:
+                pass
 
     if not solved:
         print("   [OMPL] No solution found.")
@@ -897,6 +949,11 @@ def pick_block(
     )
     print(f"   Touch Z: {touch_z:.3f}")
 
+    # Per user request: flip the elbow on the FIRST approach to the
+    # toolbox (this home → above_block phase). All later phases —
+    # descent, lift, return — leave the elbow alone.
+    first_approach_flip_elbow = True
+
     used_ompl = False
     if simOMPL is not None:
         try:
@@ -915,6 +972,7 @@ def pick_block(
                 start_config,
                 above_block,
                 floor_handle=floor_handle,
+                flip_elbow=first_approach_flip_elbow,
             )
         except Exception as e:
             print(f"   OMPL error: {e}")
@@ -928,7 +986,8 @@ def pick_block(
             high_above = [world_pos[0], world_pos[1], HIGH_APPROACH_Z]
             print(f"   Computing high-approach joint config (Z={HIGH_APPROACH_Z})...")
             high_config, _ = compute_ik_config_silently(
-                sim, simIK, ik_env, ik_group, joints, ik_target, high_above
+                sim, simIK, ik_env, ik_group, joints, ik_target, high_above,
+                flip_elbow=first_approach_flip_elbow,
             )
             _traj_set_phase("smooth_home_to_high_approach")
             print("   Smooth joint interpolation → high approach")
@@ -937,7 +996,8 @@ def pick_block(
         # 1) Compute the above-block joint config silently (no visible teleport)
         print("   Computing above-block joint config...")
         above_config, _ = compute_ik_config_silently(
-            sim, simIK, ik_env, ik_group, joints, ik_target, above_block
+            sim, simIK, ik_env, ik_group, joints, ik_target, above_block,
+            flip_elbow=first_approach_flip_elbow,
         )
         print(f"   Goal config (rad): {[round(x,3) for x in above_config]}")
 

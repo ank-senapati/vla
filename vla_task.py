@@ -60,14 +60,14 @@ SMOOTH_STEPS_DESCEND = 80
 SMOOTH_DELAY = 0.012
 GRATE_PLACE_Z_OFFSET = 0.05  # drop the grate this high above panel origin
 GRATE_PICK_Z_OFFSET = 0.11   # stop this high ABOVE the grate's origin Z when picking
-SCREW_DRIVE_Z_OFFSET = 0.11  # stop this high ABOVE the screw's origin Z when driving
+SCREW_DRIVE_Z_OFFSET = 0.10  # stop this high ABOVE the screw's origin Z when driving
 # The grate mesh extends asymmetrically from its origin (more toward +X/+Y
 # where the screws are). After placing the origin at the panel center, the
 # grate body is visually shifted. This nudge compensates so the grate's
 # VISUAL center lands on the panel's center. Tune these if placement looks off.
 GRATE_PLACE_XY_NUDGE = (0.01, -0.02)  # meters, applied to the tip target
 SCREW_PUSH_DEPTH = 0.01      # meters to press each screw down
-SCREW_DRIVE_XY_NUDGE = (0.0, 0.015)  # (dX, dY) meters — nudge applied to tip target for screw driving
+SCREW_DRIVE_XY_NUDGE = (0.0, 0.01)  # (dX, dY) meters — nudge applied to tip target for screw driving
 IK_SETTLE_ITERS = 20
 IK_SOLVE_ITERS = 100
 
@@ -1188,11 +1188,12 @@ def drive_screw(st, screw_handle, idx):
     print(f"   bit offset XY   = [{bit_offset_xy[0]:+.4f}, {bit_offset_xy[1]:+.4f}]  "
           f"(screwdriver_root - tip)")
 
-    # ── 2. Tip target so the BIT lands on the screw ──
+    # ── 2. Tip target so the BIT lands on the screw + manual nudge ──
     target_tip_xy = [
-        screw_pos[0] - bit_offset_xy[0],
-        screw_pos[1] - bit_offset_xy[1],
+        screw_pos[0] - bit_offset_xy[0] + SCREW_DRIVE_XY_NUDGE[0],
+        screw_pos[1] - bit_offset_xy[1] + SCREW_DRIVE_XY_NUDGE[1],
     ]
+    print(f"   nudge XY        = [{SCREW_DRIVE_XY_NUDGE[0]:+.4f}, {SCREW_DRIVE_XY_NUDGE[1]:+.4f}]")
     print(f"   tip target XY   = [{target_tip_xy[0]:+.4f}, {target_tip_xy[1]:+.4f}]")
 
     # ── 3. Approach above the screw ──

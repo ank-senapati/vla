@@ -1438,146 +1438,172 @@ def main(task=None, force_color=None, no_reload=False):
         sim.startSimulation()
         time.sleep(0.3)
 
-    # Let IK settle before capturing home pose
-    for _ in range(IK_SETTLE_ITERS):
-        simIK.handleGroup(st.ik_env, st.ik_group, {"syncWorlds": True})
-        time.sleep(0.02)
+    interrupted = False
+    try:
+        # Let IK settle before capturing home pose
+        for _ in range(IK_SETTLE_ITERS):
+            simIK.handleGroup(st.ik_env, st.ik_group, {"syncWorlds": True})
+            time.sleep(0.02)
 
-    st.home_config = [sim.getJointPosition(j) for j in st.joints]
-    print(f"\nHome config (rad): {[round(q, 3) for q in st.home_config]}")
-    home_tip = sim.getObjectPosition(st.tip_dummy, sim.handle_world)
-    print(f"Home tip world pos: {home_tip}")
+        st.home_config = [sim.getJointPosition(j) for j in st.joints]
+        print(f"\nHome config (rad): {[round(q, 3) for q in st.home_config]}")
+        home_tip = sim.getObjectPosition(st.tip_dummy, sim.handle_world)
+        print(f"Home tip world pos: {home_tip}")
 
-    _traj_set_phase("start")
-    _traj_record(sim, st.joints)
+        _traj_set_phase("start")
+        _traj_record(sim, st.joints)
 
-    task_ok = True
+        task_ok = True
 
-    # ── Determine what to run ──
-    #
-    #   --task "<text>"  → LLaVA picks ONE tool. ONLY that tool's routine
-    #                      runs. No automatic prerequisites — if you need
-    #                      the grate placed first, run that task in a
-    #                      separate invocation, then use --no-reload.
-    #
-    #   --color <c>      → Same but LLaVA is bypassed; color is forced.
-    #
-    #   neither          → Default full demo: grate (forced green) then
-    #                      screws (forced red), no LLaVA.
+        # ── Determine what to run ──
+        #
+        #   --task "<text>"  → LLaVA picks ONE tool. ONLY that tool's routine
+        #                      runs. No automatic prerequisites — if you need
+        #                      the grate placed first, run that task in a
+        #                      separate invocation, then use --no-reload.
+        #
+        #   --color <c>      → Same but LLaVA is bypassed; color is forced.
+        #
+        #   neither          → Default full demo: grate (forced green) then
+        #                      screws (forced red), no LLaVA.
 
-    if task is not None:
-        # ── --task mode: LLaVA decides the tool, run ONLY that routine ──
-        _begin_phase("vlm_select_user")
-        chosen_color = query_vlm(st, task, expected_color=None)
-        _end_phase("vlm_select_user")
-        if chosen_color is None:
-            _fail("vlm_select_user", "no reply from VLM")
-            task_ok = False
-        if task_ok:
-            print(f"\n>>> USER TASK — \"{task}\"")
+        if task is not None:
+            # ── --task mode: LLaVA decides the tool, run ONLY that routine ──
+            _begin_phase("vlm_select_user")
+            chosen_color = query_vlm(st, task, expected_color=None)
+            _end_phase("vlm_select_user")
+            if chosen_color is None:
+                _fail("vlm_select_user", "no reply from VLM")
+                task_ok = False
+            if task_ok:
+                print(f"\n>>> USER TASK — \"{task}\"")
+                if not _run_one_task(
+                    st, task, expected_color=None,
+                    force_color=chosen_color, phase_suffix="user",
+                ):
+                    task_ok = False
+
+        elif force_color is not None:
+            # ── --color mode: run ONLY that tool's routine, no LLaVA ──
+            canned = {
+                "red":   TASK_B_DESC,
+                "green": TASK_A_DESC,
+                "blue":  "I need to rivet two parts together.",
+            }[force_color]
+            print(f"\n>>> USER TASK (forced {force_color}) — \"{canned}\"")
             if not _run_one_task(
-                st, task, expected_color=None,
-                force_color=chosen_color, phase_suffix="user",
+                st, canned, expected_color=None,
+                force_color=force_color, phase_suffix="user",
             ):
                 task_ok = False
 
-    elif force_color is not None:
-        # ── --color mode: run ONLY that tool's routine, no LLaVA ──
-        canned = {
-            "red":   TASK_B_DESC,
-            "green": TASK_A_DESC,
-            "blue":  "I need to rivet two parts together.",
-        }[force_color]
-        print(f"\n>>> USER TASK (forced {force_color}) — \"{canned}\"")
-        if not _run_one_task(
-            st, canned, expected_color=None,
-            force_color=force_color, phase_suffix="user",
-        ):
-            task_ok = False
-
-    else:
-        # ── Default mode: full demo, no LLaVA ──
-        # Phase 1: grate (forced green)
-        print(f"\n>>> PHASE 1 (forced green) — \"{TASK_A_DESC}\"")
-        if not _run_one_task(
-            st, TASK_A_DESC, expected_color=TASK_A_EXPECTED,
-            force_color="green", phase_suffix="grate",
-        ):
-            task_ok = False
-        # Phase 2: screws (forced red)
-        if task_ok:
-            print(f"\n>>> PHASE 2 (forced red) — \"{TASK_B_DESC}\"")
+        else:
+            # ── Default mode: full demo, no LLaVA ──
+            # Phase 1: grate (forced green)
+            print(f"\n>>> PHASE 1 (forced green) — \"{TASK_A_DESC}\"")
             if not _run_one_task(
-                st, TASK_B_DESC, expected_color=TASK_B_EXPECTED,
-                force_color="red", phase_suffix="user",
+                st, TASK_A_DESC, expected_color=TASK_A_EXPECTED,
+                force_color="green", phase_suffix="grate",
             ):
                 task_ok = False
+            # Phase 2: screws (forced red)
+            if task_ok:
+                print(f"\n>>> PHASE 2 (forced red) — \"{TASK_B_DESC}\"")
+                if not _run_one_task(
+                    st, TASK_B_DESC, expected_color=TASK_B_EXPECTED,
+                    force_color="red", phase_suffix="user",
+                ):
+                    task_ok = False
 
-    # ───── Return home ─────
-    _begin_phase("return_home")
-    current = [sim.getJointPosition(j) for j in st.joints]
-    home_normalized = _normalize_config_close(st.home_config, current)
-    move_joints_smooth(sim, st.joints, home_normalized,
-                        steps=SMOOTH_STEPS_TRANSIT, delay=SMOOTH_DELAY)
-    resync_ik_target_local(st)
-    _end_phase("return_home")
+        # ───── Return home ─────
+        _begin_phase("return_home")
+        current = [sim.getJointPosition(j) for j in st.joints]
+        home_normalized = _normalize_config_close(st.home_config, current)
+        move_joints_smooth(sim, st.joints, home_normalized,
+                            steps=SMOOTH_STEPS_TRANSIT, delay=SMOOTH_DELAY)
+        resync_ik_target_local(st)
+        _end_phase("return_home")
 
-    # ───── Metrics ─────
-    METRICS["task_success"] = task_ok
-    # Only count VLM selections that had a known expected answer when
-    # computing accuracy (free-form --task queries have correct=None
-    # because we don't know the right answer).
-    scored = [v for v in METRICS["vlm_tool_selections"]
-              if v.get("correct") is not None]
-    if scored:
-        n_correct = sum(1 for v in scored if v["correct"])
-        METRICS["vlm_accuracy"] = round(n_correct / len(scored), 3)
-    else:
-        METRICS["vlm_accuracy"] = None
-    pos_errs = [e["error_mm"] for e in METRICS["position_errors_mm"]]
-    if pos_errs:
-        METRICS["mean_position_error_mm"] = round(sum(pos_errs) / len(pos_errs), 2)
-        METRICS["max_position_error_mm"] = round(max(pos_errs), 2)
-    ori_errs = [e["max_deg"] for e in METRICS["orientation_errors_deg"]]
-    if ori_errs:
-        METRICS["mean_orientation_error_deg"] = round(sum(ori_errs) / len(ori_errs), 2)
-        METRICS["max_orientation_error_deg"] = round(max(ori_errs), 2)
+        # ───── Metrics ─────
+        METRICS["task_success"] = task_ok
+        # Only count VLM selections that had a known expected answer when
+        # computing accuracy (free-form --task queries have correct=None
+        # because we don't know the right answer).
+        scored = [v for v in METRICS["vlm_tool_selections"]
+                  if v.get("correct") is not None]
+        if scored:
+            n_correct = sum(1 for v in scored if v["correct"])
+            METRICS["vlm_accuracy"] = round(n_correct / len(scored), 3)
+        else:
+            METRICS["vlm_accuracy"] = None
+        pos_errs = [e["error_mm"] for e in METRICS["position_errors_mm"]]
+        if pos_errs:
+            METRICS["mean_position_error_mm"] = round(sum(pos_errs) / len(pos_errs), 2)
+            METRICS["max_position_error_mm"] = round(max(pos_errs), 2)
+        ori_errs = [e["max_deg"] for e in METRICS["orientation_errors_deg"]]
+        if ori_errs:
+            METRICS["mean_orientation_error_deg"] = round(sum(ori_errs) / len(ori_errs), 2)
+            METRICS["max_orientation_error_deg"] = round(max(ori_errs), 2)
 
-    with open("task_metrics.json", "w") as f:
-        json.dump(METRICS, f, indent=2)
-    with open("task_trajectory.json", "w") as f:
-        json.dump({"samples": TRAJECTORY, "meta": {
-            "home_config": st.home_config,
-            "num_samples": len(TRAJECTORY),
-        }}, f, indent=2)
+        with open("task_metrics.json", "w") as f:
+            json.dump(METRICS, f, indent=2)
+        with open("task_trajectory.json", "w") as f:
+            json.dump({"samples": TRAJECTORY, "meta": {
+                "home_config": st.home_config,
+                "num_samples": len(TRAJECTORY),
+            }}, f, indent=2)
 
-    print("\n" + "=" * 60)
-    print(f"  task_success       : {task_ok}")
-    print(f"  vlm_accuracy       : {METRICS.get('vlm_accuracy')}")
-    if pos_errs:
-        print(f"  mean_pos_error_mm  : {METRICS['mean_position_error_mm']}")
-        print(f"  max_pos_error_mm   : {METRICS['max_position_error_mm']}")
-    if ori_errs:
-        print(f"  mean_ori_error_deg : {METRICS['mean_orientation_error_deg']}")
-        print(f"  max_ori_error_deg  : {METRICS['max_orientation_error_deg']}")
-    if METRICS["failure_reason"]:
-        print(f"  failure_phase      : {METRICS['failure_phase']}")
-        print(f"  failure_reason     : {METRICS['failure_reason']}")
-    print(f"  metrics saved to   : task_metrics.json")
-    print(f"  trajectory saved to: task_trajectory.json")
-    print("=" * 60)
+        print("\n" + "=" * 60)
+        print(f"  task_success       : {task_ok}")
+        print(f"  vlm_accuracy       : {METRICS.get('vlm_accuracy')}")
+        if pos_errs:
+            print(f"  mean_pos_error_mm  : {METRICS['mean_position_error_mm']}")
+            print(f"  max_pos_error_mm   : {METRICS['max_position_error_mm']}")
+        if ori_errs:
+            print(f"  mean_ori_error_deg : {METRICS['mean_orientation_error_deg']}")
+            print(f"  max_ori_error_deg  : {METRICS['max_orientation_error_deg']}")
+        if METRICS["failure_reason"]:
+            print(f"  failure_phase      : {METRICS['failure_phase']}")
+            print(f"  failure_reason     : {METRICS['failure_reason']}")
+        print(f"  metrics saved to   : task_metrics.json")
+        print(f"  trajectory saved to: task_trajectory.json")
+        print("=" * 60)
 
-    # Only stop the simulation in default (full-demo) mode. When --task
-    # or --color is used, leave the sim running so a follow-up run with
-    # --no-reload can pick up where we left off (e.g. grate is already
-    # on the panel, arm is at home).
-    if task is None and force_color is None:
-        time.sleep(2)
-        sim.stopSimulation()
-        print("\n   Simulation stopped (full demo complete).")
-    else:
-        print("\n   Simulation left running — use --no-reload on the next "
-              "run to continue from this state.")
+    except KeyboardInterrupt:
+        interrupted = True
+        print("\n\n" + "!" * 60)
+        print("  INTERRUPTED BY USER (Ctrl+C)")
+        print("  Halting trajectory and safely stopping simulation...")
+        print("!" * 60 + "\n")
+
+    finally:
+        # Determine if we should force a stop. We stop if interrupted, OR if it's the default full demo.
+        should_stop = interrupted or (task is None and force_color is None)
+
+        if should_stop:
+            if not interrupted:
+                time.sleep(2)
+                print("\n   Simulation stopped (full demo complete).")
+            
+            # Ensures the simulator always stops, even if the ZMQ socket is broken from the interrupt
+            try:
+                sim.stopSimulation()
+            except Exception:
+                # The socket is out-of-sync. Spin up a fresh "rescue" client to force the stop.
+                try:
+                    rescue_client = RemoteAPIClient()
+                    rescue_sim = rescue_client.require("sim")
+                    rescue_sim.removeObjectFromSelection(rescue_sim.handle_all)
+                    rescue_sim.stopSimulation()
+                except Exception as rescue_e:
+                    print(f"  [Warning] Could not forcefully stop simulation: {rescue_e}")
+                    
+            if interrupted:
+                print("Simulation stopped.")
+        else:
+            # Leave running for --no-reload chaining
+            print("\n   Simulation left running — use --no-reload on the next "
+                  "run to continue from this state.")
 
 
 if __name__ == "__main__":

@@ -424,23 +424,23 @@ def setup_scene(sim, simIK, no_reload=False):
     rivet_dummy = sim.getObject("/rivet_dummy")
     screw_dummy = sim.getObject("/screw_dummy")
 
-    # Defensive: an earlier (now-removed) visibility-hide approach could
-    # have left tool / arm shapes stuck on visibility layer 0 across
-    # reload-less re-runs. Force every shape in the UR5 + tools subtrees
-    # back to visibility layer 1 (the standard "always visible" layer)
-    # so a freshly loaded scene starts cleanly visible no matter what.
-    for root in [st.ur5, claw, rivet, screwdriver]:
-        try:
-            for o in sim.getObjectsInTree(root, sim.handle_all, 0):
-                try:
-                    if sim.getObjectType(o) == sim.object_shape_type:
-                        sim.setObjectInt32Param(
-                            o, sim.objintparam_visibility_layer, 1
-                        )
-                except Exception:
-                    pass
-        except Exception:
-            pass
+    # # Defensive: an earlier (now-removed) visibility-hide approach could
+    # # have left tool / arm shapes stuck on visibility layer 0 across
+    # # reload-less re-runs. Force every shape in the UR5 + tools subtrees
+    # # back to visibility layer 1 (the standard "always visible" layer)
+    # # so a freshly loaded scene starts cleanly visible no matter what.
+    # for root in [st.ur5, claw, rivet, screwdriver]:
+    #     try:
+    #         for o in sim.getObjectsInTree(root, sim.handle_all, 0):
+    #             try:
+    #                 if sim.getObjectType(o) == sim.object_shape_type:
+    #                     sim.setObjectInt32Param(
+    #                         o, sim.objintparam_visibility_layer, 1
+    #                     )
+    #             except Exception:
+    #                 pass
+    #     except Exception:
+    #         pass
 
     # Tools: also make them static so they stay in their toolbox slots
     for tool_root in [claw, rivet, screwdriver]:

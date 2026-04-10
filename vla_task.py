@@ -76,8 +76,15 @@ SIDE_CAM_RES_Y = 540
 SIDE_CAM_FOV_DEG = 85.0
 SIDE_CAM_NEAR = 0.01
 SIDE_CAM_FAR = 10.0
-SIDE_CAM_POS = [1.35, -1.8, 0.8]
-SIDE_CAM_ORI = [-1.885, 0.0, math.pi]
+
+# Centered directly in front of the workspace, pulled back, and elevated
+SIDE_CAM_POS = [0.9, -1.5, 1.1]
+
+# Alpha = -115 (pitched down 25 degrees from horizontal)
+# Beta = 0 (no roll)
+# Gamma = 180 (looking straight ahead, no yaw = perfectly flat floor!)
+SIDE_CAM_ORI_DEG = [-115.0, 0.0, 180.0] 
+SIDE_CAM_ORI = [math.radians(a) for a in SIDE_CAM_ORI_DEG]
 
 _SIDE_VIDEO_WRITER = None
 _SIDE_VIDEO_SENSOR = None
@@ -342,6 +349,13 @@ def setup_scene(sim, simIK, no_reload=False):
         print(f"Loading scene: {SCENE_PATH}")
         sim.loadScene(SCENE_PATH)
         time.sleep(0.6)
+        try:
+            default_cam = sim.getObject("/DefaultCamera")
+            # Reuse your existing side-camera coordinates for the main view
+            sim.setObjectPosition(default_cam, sim.handle_world, SIDE_CAM_POS)
+            sim.setObjectOrientation(default_cam, sim.handle_world, SIDE_CAM_ORI)
+        except Exception as e:
+            print(f"   (Could not reset DefaultCamera: {e})")
     else:
         print("--no-reload: reusing existing scene (simulation must be running)")
 

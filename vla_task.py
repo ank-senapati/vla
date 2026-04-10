@@ -135,6 +135,11 @@ def _wrap_angle(a):
     return a
 
 
+def _interp_angle_shortest(a0, a1, t):
+    """Interpolate Euler component along the shortest angular path."""
+    return a0 + _wrap_angle(a1 - a0) * t
+
+
 def _log_position_error(phase, target, actual):
     err = math.sqrt(sum((target[i] - actual[i]) ** 2 for i in range(3)))
     METRICS["position_errors_mm"].append({
@@ -186,6 +191,31 @@ class SimState:
     pass
 
 
+def _set_shapes_visibility(sim, shapes, layer):
+    """Set visibility layer for a list of shape handles.
+
+    Returns a list of (handle, previous_layer) so callers can restore.
+    """
+    previous = []
+    for h in shapes:
+        try:
+            prev = sim.getObjectInt32Param(h, sim.objintparam_visibility_layer)
+            previous.append((h, prev))
+            sim.setObjectInt32Param(h, sim.objintparam_visibility_layer, layer)
+        except Exception:
+            pass
+    return previous
+
+
+def _restore_shapes_visibility(sim, saved_layers):
+    """Restore shape visibility layers captured by _set_shapes_visibility."""
+    for h, layer in saved_layers:
+        try:
+            sim.setObjectInt32Param(h, sim.objintparam_visibility_layer, layer)
+        except Exception:
+            pass
+
+
 # ─────────────────────────── Scene loading ────────────────────
 def find_ur5_joints(sim, ur5):
     """Return the 6 kinematic joints under /UR5, excluding /UR5/Revolute_joint,
@@ -233,6 +263,13 @@ def setup_scene(sim, simIK, no_reload=False):
     st.ur5 = sim.getObject("/UR5")
     st.tip_dummy = sim.getObject("/UR5/dummy")
     st.joints = find_ur5_joints(sim, st.ur5)
+    try:
+        st.ur5_shapes = [
+            o for o in sim.getObjectsInTree(st.ur5, sim.handle_all, 0)
+            if sim.getObjectType(o) == sim.object_shape_type
+        ]
+    except Exception:
+        st.ur5_shapes = []
     print(f"   Found {len(st.joints)} UR5 kinematic joints")
 
     # ─── Stabilize the robot: remove ALL scripts in the UR5 subtree, set
@@ -459,6 +496,7 @@ def compute_ik_no_seed(st, target_pos, target_ori=None, iters=IK_SOLVE_ITERS):
     saved_q = [sim.getJointPosition(j) for j in joints]
     saved_tp = list(sim.getObjectPosition(ik_target, sim.handle_world))
     saved_to = list(sim.getObjectOrientation(ik_target, sim.handle_world))
+    hidden_layers = _set_shapes_visibility(sim, getattr(st, "ur5_shapes", []), 0)
 
     try:
         sim.setObjectPosition(ik_target, sim.handle_world,
@@ -474,6 +512,7 @@ def compute_ik_no_seed(st, target_pos, target_ori=None, iters=IK_SOLVE_ITERS):
         sim.setObjectPosition(ik_target, sim.handle_world, saved_tp)
         sim.setObjectOrientation(ik_target, sim.handle_world, saved_to)
         simIK.handleGroup(ik_env, ik_group, {"syncWorlds": True})
+        _restore_shapes_visibility(sim, hidden_layers)
 
     return _normalize_config_close(goal, saved_q)
 
@@ -506,6 +545,7 @@ def compute_ik_staged(st, target_pos, target_ori=None,
     saved_q = [sim.getJointPosition(j) for j in joints]
     saved_tp = list(sim.getObjectPosition(ik_target, sim.handle_world))
     saved_to = list(sim.getObjectOrientation(ik_target, sim.handle_world))
+    hidden_layers = _set_shapes_visibility(sim, getattr(st, "ur5_shapes", []), 0)
 
     start_pos = list(sim.getObjectPosition(st.tip_dummy, sim.handle_world))
     if target_ori is None:
@@ -551,6 +591,7 @@ def compute_ik_staged(st, target_pos, target_ori=None,
         sim.setObjectPosition(ik_target, sim.handle_world, saved_tp)
         sim.setObjectOrientation(ik_target, sim.handle_world, saved_to)
         simIK.handleGroup(ik_env, ik_group, {"syncWorlds": True})
+        _restore_shapes_visibility(sim, hidden_layers)
 
     if (final_pos_err is not None
             and (final_pos_err > 0.01 or final_ori_err_deg > 2.0)):
@@ -562,18 +603,35 @@ def compute_ik_staged(st, target_pos, target_ori=None,
 
 def move_tip_to(st, pos, ori=None, steps=SMOOTH_STEPS_TRANSIT, delay=SMOOTH_DELAY,
                 use_staged_ik=True):
-    """Silent IK solve → smooth joint-space move → resync IK target.
+    """Move tip to a world pose using continuous live IK interpolation.
 
-    By default uses staged IK (reliable for large moves). Pass
-    use_staged_ik=False to fall back to the single-shot solve, which is
-    faster but can fail on targets that are far away and/or require big
-    wrist reorientations.
+    This avoids the visible 'solve then snap-back then replay' behavior that
+    can happen with pre-solve-and-restore IK pipelines.
     """
-    if use_staged_ik:
-        cfg = compute_ik_staged(st, pos, ori)
-    else:
-        cfg = compute_ik_no_seed(st, pos, ori)
-    move_joints_smooth(st.sim, st.joints, cfg, steps=steps, delay=delay)
+    sim = st.sim
+    simIK = st.simIK
+
+    start_pos = list(sim.getObjectPosition(st.tip_dummy, sim.handle_world))
+    start_ori = list(sim.getObjectOrientation(st.tip_dummy, sim.handle_world))
+    target_pos = [float(v) for v in pos]
+    target_ori = list(start_ori if ori is None else [float(v) for v in ori])
+
+    for i in range(1, steps + 1):
+        # Cosine easing keeps motion smooth at start/end.
+        u = 0.5 - 0.5 * math.cos(math.pi * (i / steps))
+        p = [start_pos[k] + (target_pos[k] - start_pos[k]) * u for k in range(3)]
+        o = [_interp_angle_shortest(start_ori[k], target_ori[k], u) for k in range(3)]
+
+        sim.setObjectPosition(st.ik_target, sim.handle_world, p)
+        sim.setObjectOrientation(st.ik_target, sim.handle_world, o)
+
+        # A couple of IK iterations per substep keeps tracking tight.
+        simIK.handleGroup(st.ik_env, st.ik_group, {"syncWorlds": True})
+        simIK.handleGroup(st.ik_env, st.ik_group, {"syncWorlds": True})
+
+        _traj_record(sim, st.joints)
+        time.sleep(delay)
+
     resync_ik_target_local(st)
 
 

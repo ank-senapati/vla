@@ -60,7 +60,7 @@ SMOOTH_STEPS_DESCEND = 80
 SMOOTH_DELAY = 0.012
 GRATE_PLACE_Z_OFFSET = 0.05  # drop the grate this high above panel origin
 GRATE_PICK_Z_OFFSET = 0.11   # stop this high ABOVE the grate's origin Z when picking
-SCREW_DRIVE_Z_OFFSET = 0.10  # stop this high ABOVE the screw's origin Z when driving
+SCREW_DRIVE_Z_OFFSET = 0.11  # stop this high ABOVE the screw's origin Z when driving
 # The grate mesh extends asymmetrically from its origin (more toward +X/+Y
 # where the screws are). After placing the origin at the panel center, the
 # grate body is visually shifted. This nudge compensates so the grate's
@@ -461,6 +461,7 @@ def compute_ik_no_seed(st, target_pos, target_ori=None, iters=IK_SOLVE_ITERS):
     saved_q = [sim.getJointPosition(j) for j in joints]
     saved_tp = list(sim.getObjectPosition(ik_target, sim.handle_world))
     saved_to = list(sim.getObjectOrientation(ik_target, sim.handle_world))
+    hidden = _hide_ur5_scene_temporarily(st)
 
     try:
         sim.setObjectPosition(ik_target, sim.handle_world,
@@ -476,6 +477,7 @@ def compute_ik_no_seed(st, target_pos, target_ori=None, iters=IK_SOLVE_ITERS):
         sim.setObjectPosition(ik_target, sim.handle_world, saved_tp)
         sim.setObjectOrientation(ik_target, sim.handle_world, saved_to)
         simIK.handleGroup(ik_env, ik_group, {"syncWorlds": True})
+        _restore_hidden_objects(sim, hidden)
 
     return _normalize_config_close(goal, saved_q)
 
@@ -508,6 +510,7 @@ def compute_ik_staged(st, target_pos, target_ori=None,
     saved_q = [sim.getJointPosition(j) for j in joints]
     saved_tp = list(sim.getObjectPosition(ik_target, sim.handle_world))
     saved_to = list(sim.getObjectOrientation(ik_target, sim.handle_world))
+    hidden = _hide_ur5_scene_temporarily(st)
 
     start_pos = list(sim.getObjectPosition(st.tip_dummy, sim.handle_world))
     if target_ori is None:
@@ -553,6 +556,7 @@ def compute_ik_staged(st, target_pos, target_ori=None,
         sim.setObjectPosition(ik_target, sim.handle_world, saved_tp)
         sim.setObjectOrientation(ik_target, sim.handle_world, saved_to)
         simIK.handleGroup(ik_env, ik_group, {"syncWorlds": True})
+        _restore_hidden_objects(sim, hidden)
 
     if (final_pos_err is not None
             and (final_pos_err > 0.01 or final_ori_err_deg > 2.0)):
@@ -1587,12 +1591,14 @@ def main(task=None, force_color=None, no_reload=False):
             
             # Ensures the simulator always stops, even if the ZMQ socket is broken from the interrupt
             try:
+                _clear_object_selection(sim)
                 sim.stopSimulation()
             except Exception:
                 # The socket is out-of-sync. Spin up a fresh "rescue" client to force the stop.
                 try:
                     rescue_client = RemoteAPIClient()
                     rescue_sim = rescue_client.require("sim")
+                    _clear_object_selection(rescue_sim)
                     rescue_sim.removeObjectFromSelection(rescue_sim.handle_all)
                     rescue_sim.stopSimulation()
                 except Exception as rescue_e:

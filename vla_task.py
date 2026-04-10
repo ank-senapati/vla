@@ -60,12 +60,14 @@ SMOOTH_STEPS_DESCEND = 80
 SMOOTH_DELAY = 0.012
 GRATE_PLACE_Z_OFFSET = 0.05  # drop the grate this high above panel origin
 GRATE_PICK_Z_OFFSET = 0.11   # stop this high ABOVE the grate's origin Z when picking
+SCREW_DRIVE_Z_OFFSET = 0.11  # stop this high ABOVE the screw's origin Z when driving
 # The grate mesh extends asymmetrically from its origin (more toward +X/+Y
 # where the screws are). After placing the origin at the panel center, the
 # grate body is visually shifted. This nudge compensates so the grate's
 # VISUAL center lands on the panel's center. Tune these if placement looks off.
 GRATE_PLACE_XY_NUDGE = (0.01, -0.02)  # meters, applied to the tip target
 SCREW_PUSH_DEPTH = 0.01      # meters to press each screw down
+SCREW_DRIVE_XY_NUDGE = (0.0, 0.015)  # (dX, dY) meters — nudge applied to tip target for screw driving
 IK_SETTLE_ITERS = 20
 IK_SOLVE_ITERS = 100
 
@@ -207,13 +209,24 @@ def find_ur5_joints(sim, ur5):
     return joints
 
 
-def setup_scene(sim, simIK):
-    """Load the scene and build SimState with all object handles."""
-    sim.stopSimulation()
-    time.sleep(0.3)
-    print(f"Loading scene: {SCENE_PATH}")
-    sim.loadScene(SCENE_PATH)
-    time.sleep(0.6)
+def setup_scene(sim, simIK, no_reload=False):
+    """Load the scene and build SimState with all object handles.
+
+    If ``no_reload`` is True, assumes the scene is ALREADY loaded and the
+    simulation is ALREADY running (from a previous ``vla_task.py`` run).
+    Skips ``loadScene``, ``stopSimulation``, and UR5 stabilization — just
+    finds the existing object handles and sets up a fresh IK environment.
+    This lets you chain tasks across multiple script invocations without
+    losing the scene state (e.g. a placed grate).
+    """
+    if not no_reload:
+        sim.stopSimulation()
+        time.sleep(0.3)
+        print(f"Loading scene: {SCENE_PATH}")
+        sim.loadScene(SCENE_PATH)
+        time.sleep(0.6)
+    else:
+        print("--no-reload: reusing existing scene (simulation must be running)")
 
     st = SimState()
     st.sim = sim
@@ -228,38 +241,39 @@ def setup_scene(sim, simIK):
     # every shape static, every joint kinematic, and mark the whole model
     # non-dynamic. Without this the robot links fall under gravity as
     # soon as startSimulation() is called. Mirrors vla.py setup_vla_environment.
-    ur5_tree = sim.getObjectsInTree(st.ur5, sim.handle_all, 0)
-    n_scripts_removed = 0
-    n_shapes_static = 0
-    n_joints_kinematic = 0
-    for obj in ur5_tree:
+    # SKIPPED on --no-reload because this was already done on the first run.
+    if not no_reload:
+        ur5_tree = sim.getObjectsInTree(st.ur5, sim.handle_all, 0)
+        n_scripts_removed = 0
+        n_shapes_static = 0
+        n_joints_kinematic = 0
+        for obj in ur5_tree:
+            try:
+                t = sim.getObjectType(obj)
+                if t == sim.object_script_type:
+                    sim.removeObjects([obj])
+                    n_scripts_removed += 1
+                elif t == sim.object_shape_type:
+                    sim.setObjectInt32Param(obj, sim.shapeintparam_static, 1)
+                    try:
+                        sim.setObjectInt32Param(obj, sim.shapeintparam_respondable, 0)
+                    except Exception:
+                        pass
+                    n_shapes_static += 1
+                elif t == sim.object_joint_type:
+                    try:
+                        sim.setJointMode(obj, sim.jointmode_kinematic, 0)
+                    except TypeError:
+                        sim.setJointMode(obj, sim.jointmode_kinematic)
+                    n_joints_kinematic += 1
+            except Exception as e:
+                pass
         try:
-            t = sim.getObjectType(obj)
-            if t == sim.object_script_type:
-                sim.removeObjects([obj])
-                n_scripts_removed += 1
-            elif t == sim.object_shape_type:
-                sim.setObjectInt32Param(obj, sim.shapeintparam_static, 1)
-                # Also mark it non-respondable so it doesn't collide with itself
-                try:
-                    sim.setObjectInt32Param(obj, sim.shapeintparam_respondable, 0)
-                except Exception:
-                    pass
-                n_shapes_static += 1
-            elif t == sim.object_joint_type:
-                try:
-                    sim.setJointMode(obj, sim.jointmode_kinematic, 0)
-                except TypeError:
-                    sim.setJointMode(obj, sim.jointmode_kinematic)
-                n_joints_kinematic += 1
+            sim.setObjectInt32Param(st.ur5, sim.modelproperty_not_dynamic, 1)
         except Exception as e:
-            pass
-    try:
-        sim.setObjectInt32Param(st.ur5, sim.modelproperty_not_dynamic, 1)
-    except Exception as e:
-        print(f"   (modelproperty_not_dynamic: {e})")
-    print(f"   Stabilized UR5: {n_scripts_removed} scripts removed, "
-          f"{n_shapes_static} shapes→static, {n_joints_kinematic} joints→kinematic")
+            print(f"   (modelproperty_not_dynamic: {e})")
+        print(f"   Stabilized UR5: {n_scripts_removed} scripts removed, "
+              f"{n_shapes_static} shapes→static, {n_joints_kinematic} joints→kinematic")
 
     # Work-piece handles
     st.grate = sim.getObject("/Grate_Assembly")
@@ -270,15 +284,13 @@ def setup_scene(sim, simIK):
     ]
     st.toolbox = sim.getObject("/Preliminary_Toolbox_decimated")
 
-    # Make the work pieces and toolbox static too, so they don't drift from
-    # the spots we captured at startup. They'll still move when we parent
-    # them to the tip (child shapes follow the parent transform regardless
-    # of static state).
-    for handle in [st.grate, st.panel, st.toolbox] + list(st.screws):
-        try:
-            sim.setObjectInt32Param(handle, sim.shapeintparam_static, 1)
-        except Exception as e:
-            print(f"   (static set on {handle}: {e})")
+    # Make the work pieces and toolbox static (skipped on --no-reload)
+    if not no_reload:
+        for handle in [st.grate, st.panel, st.toolbox] + list(st.screws):
+            try:
+                sim.setObjectInt32Param(handle, sim.shapeintparam_static, 1)
+            except Exception as e:
+                print(f"   (static set on {handle}: {e})")
 
     # Tools and their attach dummies
     claw = sim.getObject("/Claw_Assembly")
@@ -1156,63 +1168,80 @@ def drive_screw(st, screw_handle, idx):
         return False
 
     sim = st.sim
-
-    # Keep the SAME tip orientation as the toolbox attach — no rotation.
     tip_ori = list(st.universal_attach_ori)
-
     screw_pos = list(sim.getObjectPosition(screw_handle, sim.handle_world))
-    tip_ori_deg = [round(math.degrees(v), 2) for v in tip_ori]
     print(f"   screw[{idx}] target pos = "
           f"[{screw_pos[0]:+.4f}, {screw_pos[1]:+.4f}, {screw_pos[2]:+.4f}]")
-    print(f"   screw[{idx}] tip ori    = "
-          f"[{tip_ori_deg[0]:+.2f}, {tip_ori_deg[1]:+.2f}, "
-          f"{tip_ori_deg[2]:+.2f}] deg  (SAME AS TOOLBOX ATTACH)")
 
-    # ── Approach: above the screw ──
-    above_screw_pos = [screw_pos[0], screw_pos[1],
-                       screw_pos[2] + APPROACH_HEIGHT]
-    move_tip_to(st, above_screw_pos, ori=tip_ori, steps=SMOOTH_STEPS_TRANSIT)
+    # ── 1. Measure screwdriver bit offset from tip ──
+    # screw_dummy is the ATTACH point (top of screwdriver) — it sits
+    # right at the tip, so its offset is ~0, which is useless.
+    # The screwdriver ROOT is at the body/bit end. After the tip rotates
+    # to the universal_attach_ori, the screwdriver hangs tilted, so the
+    # root (bit end) is laterally offset from the tip. We use the ROOT's
+    # world position as the proxy for where the bit actually is.
+    screwdriver_root = st.tools["screwdriver"]["root"]
+    bit_pos = list(sim.getObjectPosition(screwdriver_root, sim.handle_world))
+    tip_now = list(sim.getObjectPosition(st.tip_dummy, sim.handle_world))
+    bit_offset_xy = [bit_pos[i] - tip_now[i] for i in range(2)]
+    print(f"   screwdriver root= [{bit_pos[0]:+.4f}, {bit_pos[1]:+.4f}]")
+    print(f"   bit offset XY   = [{bit_offset_xy[0]:+.4f}, {bit_offset_xy[1]:+.4f}]  "
+          f"(screwdriver_root - tip)")
 
-    # ── Descend: tip at the screw ──
-    move_tip_to(st, screw_pos, ori=tip_ori, steps=SMOOTH_STEPS_DESCEND)
+    # ── 2. Tip target so the BIT lands on the screw ──
+    target_tip_xy = [
+        screw_pos[0] - bit_offset_xy[0],
+        screw_pos[1] - bit_offset_xy[1],
+    ]
+    print(f"   tip target XY   = [{target_tip_xy[0]:+.4f}, {target_tip_xy[1]:+.4f}]")
 
-    # Refine alignment with extra IK iterations
-    refine_tip_alignment(
-        st, screw_pos, tip_ori,
-        label=f"drive_screw_{idx}_align",
+    # ── 3. Approach above the screw ──
+    above_pos = [target_tip_xy[0], target_tip_xy[1],
+                 screw_pos[2] + APPROACH_HEIGHT]
+    move_tip_to(st, above_pos, ori=tip_ori, steps=SMOOTH_STEPS_TRANSIT)
+
+    # ── 4. Descend ──
+    descend_pos = [target_tip_xy[0], target_tip_xy[1],
+                   screw_pos[2] + SCREW_DRIVE_Z_OFFSET]
+    move_tip_to(st, descend_pos, ori=tip_ori, steps=SMOOTH_STEPS_DESCEND)
+    refine_tip_alignment(st, descend_pos, tip_ori,
+                          label=f"drive_screw_{idx}_align")
+
+    # ── 5. Verify bit (screwdriver root) is over the screw ──
+    bit_after = list(sim.getObjectPosition(screwdriver_root, sim.handle_world))
+    bit_vs_screw = math.sqrt(
+        (bit_after[0] - screw_pos[0]) ** 2
+        + (bit_after[1] - screw_pos[1]) ** 2
     )
-
-    # ── Verify ──
+    print(f"   bit vs screw XY error: {bit_vs_screw * 1000:.2f} mm")
     tip_world_pos = list(sim.getObjectPosition(st.tip_dummy, sim.handle_world))
     tip_world_ori = list(sim.getObjectOrientation(st.tip_dummy, sim.handle_world))
     _log_pose_error(f"drive_screw_{idx}_align",
-                    screw_pos, tip_ori,
-                    tip_world_pos, tip_world_ori)
+                    descend_pos, tip_ori, tip_world_pos, tip_world_ori)
 
-    # ── Parent the screw to the wrist so it moves with us ──
+    # ── 6. Parent the screw ──
     sim.setObjectParent(screw_handle, st.tip_dummy, True)
     try:
         sim.resetDynamicObject(screw_handle)
-    except Exception as e:
-        print(f"   resetDynamicObject(screw): {e}")
+    except Exception:
+        pass
 
-    # ── Push straight down by SCREW_PUSH_DEPTH ──
-    pushed_pos = [screw_pos[0], screw_pos[1],
-                  screw_pos[2] - SCREW_PUSH_DEPTH]
+    # ── 7. Push straight down from the offset height ──
+    pushed_pos = [target_tip_xy[0], target_tip_xy[1],
+                  screw_pos[2] + SCREW_DRIVE_Z_OFFSET - SCREW_PUSH_DEPTH]
     move_tip_to(st, pushed_pos, ori=tip_ori, steps=60)
-
     screw_final = list(sim.getObjectPosition(screw_handle, sim.handle_world))
     _log_position_error(f"drive_screw_{idx}_pushed", pushed_pos, screw_final)
 
-    # ── Release the screw to the scene root ──
+    # ── 8. Release ──
     sim.setObjectParent(screw_handle, -1, True)
     try:
         sim.resetDynamicObject(screw_handle)
-    except Exception as e:
-        print(f"   resetDynamicObject(screw): {e}")
+    except Exception:
+        pass
 
-    # ── Lift back above the screw ──
-    move_tip_to(st, above_screw_pos, ori=tip_ori, steps=SMOOTH_STEPS_DESCEND)
+    # ── 9. Lift ──
+    move_tip_to(st, above_pos, ori=tip_ori, steps=SMOOTH_STEPS_DESCEND)
     return True
 
 
@@ -1383,34 +1412,30 @@ def _run_one_task(st, task_description, expected_color=None,
 
 
 # ─────────────────────────── Main ─────────────────────────────
-def main(task=None, force_color=None, skip_grate=False):
+def main(task=None, force_color=None, no_reload=False):
     """Run the task pipeline.
 
-    The grate pick & place always runs FIRST as a prerequisite (the
-    screws live on top of the grate, so the grate has to be in place
-    before the screwdriver routine makes physical sense).
-
-    After the grate phase, a SECOND phase runs the user-specified task:
-        - --task "<text>"  → LLaVA picks a tool from the description
-        - --color <c>      → LLaVA bypassed, forced to color c
-        - neither          → defaults to a screws task description
-
     Args:
-        task: Natural-language command for the VLM in the SECOND phase.
-              If None, defaults to a screws-driving task.
-        force_color: 'red' | 'green' | 'blue' to bypass LLaVA in the
-              SECOND phase and force that tool selection.
-        skip_grate: If True, skips the prerequisite grate phase. Mainly
-              useful for debugging the screws phase in isolation.
+        task: Natural-language command for the VLM.  LLaVA picks a tool
+              and ONLY that tool's routine runs. No automatic
+              prerequisites — if you need the grate placed before
+              screwing, run the grate task first then ``--no-reload``.
+        force_color: 'red' | 'green' | 'blue' to bypass LLaVA and force
+              that tool selection.
+        no_reload: If True, skip scene loading — connect to the
+              already-running simulation and pick up where the last
+              ``vla_task.py`` run left off.  The simulation is NOT
+              stopped at the end so subsequent runs can chain.
     """
     client = RemoteAPIClient()
     sim = client.require("sim")
     simIK = client.require("simIK")
 
-    st = setup_scene(sim, simIK)
+    st = setup_scene(sim, simIK, no_reload=no_reload)
 
-    sim.startSimulation()
-    time.sleep(0.3)
+    if not no_reload:
+        sim.startSimulation()
+        time.sleep(0.3)
 
     # Let IK settle before capturing home pose
     for _ in range(IK_SETTLE_ITERS):
@@ -1428,90 +1453,56 @@ def main(task=None, force_color=None, skip_grate=False):
     task_ok = True
 
     # ── Determine what to run ──
-    # The logic depends on the mode:
     #
-    #   --task "<text>"  → LLaVA picks a tool. Run ONLY that tool's
-    #                      routine. If the tool is the screwdriver,
-    #                      automatically run the grate prerequisite first
-    #                      (screws need the grate on the panel). If it's
-    #                      the grabber, ONLY run grate — no screws.
+    #   --task "<text>"  → LLaVA picks ONE tool. ONLY that tool's routine
+    #                      runs. No automatic prerequisites — if you need
+    #                      the grate placed first, run that task in a
+    #                      separate invocation, then use --no-reload.
     #
-    #   --color <c>      → Same as above but LLaVA is bypassed.
+    #   --color <c>      → Same but LLaVA is bypassed; color is forced.
     #
     #   neither          → Default full demo: grate (forced green) then
     #                      screws (forced red), no LLaVA.
 
     if task is not None:
-        # ── --task mode: LLaVA decides ──
-        # First, query LLaVA to find out which tool color the task needs.
+        # ── --task mode: LLaVA decides the tool, run ONLY that routine ──
         _begin_phase("vlm_select_user")
         chosen_color = query_vlm(st, task, expected_color=None)
         _end_phase("vlm_select_user")
         if chosen_color is None:
             _fail("vlm_select_user", "no reply from VLM")
             task_ok = False
-
         if task_ok:
-            if chosen_color == "red":
-                # Screwdriver → grate prerequisite first, then screws
-                if not skip_grate:
-                    print(f"\n>>> PREREQUISITE (forced green) — "
-                          f"\"{TASK_A_DESC}\"")
-                    if not _run_one_task(
-                        st, TASK_A_DESC, expected_color=TASK_A_EXPECTED,
-                        force_color="green", phase_suffix="grate",
-                    ):
-                        task_ok = False
-                if task_ok:
-                    print(f"\n>>> USER TASK — \"{task}\"")
-                    if not _run_one_task(
-                        st, task, expected_color=None,
-                        force_color="red", phase_suffix="user",
-                    ):
-                        task_ok = False
-            else:
-                # Green (grabber) or blue (riveter) — run ONLY that
-                # routine, no grate prerequisite.
-                print(f"\n>>> USER TASK — \"{task}\"")
-                if not _run_one_task(
-                    st, task, expected_color=None,
-                    force_color=chosen_color, phase_suffix="user",
-                ):
-                    task_ok = False
+            print(f"\n>>> USER TASK — \"{task}\"")
+            if not _run_one_task(
+                st, task, expected_color=None,
+                force_color=chosen_color, phase_suffix="user",
+            ):
+                task_ok = False
 
     elif force_color is not None:
-        # ── --color mode: deterministic override ──
-        if force_color == "red" and not skip_grate:
-            # Screwdriver → grate prerequisite first
-            print(f"\n>>> PREREQUISITE (forced green) — \"{TASK_A_DESC}\"")
-            if not _run_one_task(
-                st, TASK_A_DESC, expected_color=TASK_A_EXPECTED,
-                force_color="green", phase_suffix="grate",
-            ):
-                task_ok = False
-        if task_ok:
-            canned = {
-                "red":   TASK_B_DESC,
-                "green": TASK_A_DESC,
-                "blue":  "I need to rivet two parts together.",
-            }[force_color]
-            print(f"\n>>> USER TASK (forced {force_color}) — \"{canned}\"")
-            if not _run_one_task(
-                st, canned, expected_color=None,
-                force_color=force_color, phase_suffix="user",
-            ):
-                task_ok = False
+        # ── --color mode: run ONLY that tool's routine, no LLaVA ──
+        canned = {
+            "red":   TASK_B_DESC,
+            "green": TASK_A_DESC,
+            "blue":  "I need to rivet two parts together.",
+        }[force_color]
+        print(f"\n>>> USER TASK (forced {force_color}) — \"{canned}\"")
+        if not _run_one_task(
+            st, canned, expected_color=None,
+            force_color=force_color, phase_suffix="user",
+        ):
+            task_ok = False
 
     else:
         # ── Default mode: full demo, no LLaVA ──
         # Phase 1: grate (forced green)
-        if not skip_grate:
-            print(f"\n>>> PHASE 1 (forced green) — \"{TASK_A_DESC}\"")
-            if not _run_one_task(
-                st, TASK_A_DESC, expected_color=TASK_A_EXPECTED,
-                force_color="green", phase_suffix="grate",
-            ):
-                task_ok = False
+        print(f"\n>>> PHASE 1 (forced green) — \"{TASK_A_DESC}\"")
+        if not _run_one_task(
+            st, TASK_A_DESC, expected_color=TASK_A_EXPECTED,
+            force_color="green", phase_suffix="grate",
+        ):
+            task_ok = False
         # Phase 2: screws (forced red)
         if task_ok:
             print(f"\n>>> PHASE 2 (forced red) — \"{TASK_B_DESC}\"")
@@ -1575,56 +1566,54 @@ def main(task=None, force_color=None, skip_grate=False):
     print(f"  trajectory saved to: task_trajectory.json")
     print("=" * 60)
 
-    time.sleep(2)
-    sim.stopSimulation()
+    # Only stop the simulation in default (full-demo) mode. When --task
+    # or --color is used, leave the sim running so a follow-up run with
+    # --no-reload can pick up where we left off (e.g. grate is already
+    # on the panel, arm is at home).
+    if task is None and force_color is None:
+        time.sleep(2)
+        sim.stopSimulation()
+        print("\n   Simulation stopped (full demo complete).")
+    else:
+        print("\n   Simulation left running — use --no-reload on the next "
+              "run to continue from this state.")
 
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(
-        description="VLA task runner. The grate pick & place ALWAYS runs "
-                    "first (forced green grabber, no LLaVA). Then a second "
-                    "phase runs whatever --task / --color specifies. With no "
-                    "flags, the second phase forces the red screwdriver and "
-                    "drives the screws — LLaVA is NOT called at all in that "
-                    "default mode, matching the OpenCV-only behavior of the "
-                    "original vla.py.",
+        description="VLA task runner. With --task, LLaVA picks ONE tool and "
+                    "ONLY that tool's routine runs (no automatic grate "
+                    "prerequisite). Chain tasks by running the grate task "
+                    "first, then --task + --no-reload for screws. With no "
+                    "flags, runs the full demo (grate + screws, no LLaVA).",
     )
     task_group = parser.add_mutually_exclusive_group()
     task_group.add_argument(
         "--task",
         type=str,
         default=None,
-        help="Natural-language command passed to LLaVA for the SECOND "
-             "(post-grate) phase, e.g. \"I need to drive screws into the "
-             "grate.\". This is the ONLY mode in which LLaVA is invoked. "
-             "LLaVA picks one of red/green/blue and the robot executes "
-             "the matching sub-routine. The grate phase still runs first "
-             "(forced green) regardless of this flag.",
+        help="Natural-language command passed to LLaVA. LLaVA picks one "
+             "of red/green/blue and ONLY that tool's routine runs. "
+             "Example: \"pick and place the grate\" → green/grabber. "
+             "Example: \"screw the screws\" → red/screwdriver. "
+             "The simulation is left running afterwards so you can "
+             "chain a second --task with --no-reload.",
     )
     task_group.add_argument(
         "--color",
         choices=["red", "green", "blue"],
-        help="Force the SECOND phase tool color directly (LLaVA bypassed). "
-             "red=screwdriver+drive screws, green=grabber+pick grate again, "
-             "blue=riveter (no-op). The grate phase still runs first "
-             "(forced green).",
+        help="Force a tool color directly (LLaVA bypassed). ONLY that "
+             "tool's routine runs. red=screwdriver, green=grabber, "
+             "blue=riveter.",
     )
     parser.add_argument(
-        "--skip-grate",
+        "--no-reload",
         action="store_true",
-        help="Skip the prerequisite grate phase. Mainly useful for "
-             "debugging the second phase in isolation.",
+        help="Skip scene loading — connect to the already-running "
+             "simulation and continue from where the last run left off. "
+             "Use this for the second task in a chain: first run places "
+             "the grate, second run (with --no-reload) drives screws.",
     )
     args = parser.parse_args()
 
-    if args.color:
-        # --color is a deterministic override for the SECOND phase only.
-        # The task string is set to a sensible canned command for logging.
-        canned = {
-            "red":   "I need to drive screws into the grate.",
-            "green": "I need to place a grate on top of the yellow base.",
-            "blue":  "I need to rivet two parts together.",
-        }[args.color]
-        main(task=canned, force_color=args.color, skip_grate=args.skip_grate)
-    else:
-        main(task=args.task, skip_grate=args.skip_grate)
+    main(task=args.task, force_color=args.color, no_reload=args.no_reload)

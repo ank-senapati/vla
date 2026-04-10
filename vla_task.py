@@ -28,7 +28,6 @@ Pre-flight:
   2. Make sure Ollama is running with `llava` pulled
 """
 import os
-import sys
 import time
 import math
 import json
@@ -41,7 +40,6 @@ from coppeliasim_zmqremoteapi_client import RemoteAPIClient
 
 # Reuse utilities from vla.py
 from vla import (
-    _normalize_angle_close,
     _normalize_config_close,
     _traj_record,
     _traj_set_phase,
@@ -266,7 +264,7 @@ def setup_scene(sim, simIK, no_reload=False):
                     except TypeError:
                         sim.setJointMode(obj, sim.jointmode_kinematic)
                     n_joints_kinematic += 1
-            except Exception as e:
+            except Exception:
                 pass
         try:
             sim.setObjectInt32Param(st.ur5, sim.modelproperty_not_dynamic, 1)
@@ -461,7 +459,6 @@ def compute_ik_no_seed(st, target_pos, target_ori=None, iters=IK_SOLVE_ITERS):
     saved_q = [sim.getJointPosition(j) for j in joints]
     saved_tp = list(sim.getObjectPosition(ik_target, sim.handle_world))
     saved_to = list(sim.getObjectOrientation(ik_target, sim.handle_world))
-    hidden = _hide_ur5_scene_temporarily(st)
 
     try:
         sim.setObjectPosition(ik_target, sim.handle_world,
@@ -477,7 +474,6 @@ def compute_ik_no_seed(st, target_pos, target_ori=None, iters=IK_SOLVE_ITERS):
         sim.setObjectPosition(ik_target, sim.handle_world, saved_tp)
         sim.setObjectOrientation(ik_target, sim.handle_world, saved_to)
         simIK.handleGroup(ik_env, ik_group, {"syncWorlds": True})
-        _restore_hidden_objects(sim, hidden)
 
     return _normalize_config_close(goal, saved_q)
 
@@ -510,7 +506,6 @@ def compute_ik_staged(st, target_pos, target_ori=None,
     saved_q = [sim.getJointPosition(j) for j in joints]
     saved_tp = list(sim.getObjectPosition(ik_target, sim.handle_world))
     saved_to = list(sim.getObjectOrientation(ik_target, sim.handle_world))
-    hidden = _hide_ur5_scene_temporarily(st)
 
     start_pos = list(sim.getObjectPosition(st.tip_dummy, sim.handle_world))
     if target_ori is None:
@@ -556,7 +551,6 @@ def compute_ik_staged(st, target_pos, target_ori=None,
         sim.setObjectPosition(ik_target, sim.handle_world, saved_tp)
         sim.setObjectOrientation(ik_target, sim.handle_world, saved_to)
         simIK.handleGroup(ik_env, ik_group, {"syncWorlds": True})
-        _restore_hidden_objects(sim, hidden)
 
     if (final_pos_err is not None
             and (final_pos_err > 0.01 or final_ori_err_deg > 2.0)):
@@ -1569,8 +1563,8 @@ def main(task=None, force_color=None, no_reload=False):
         if METRICS["failure_reason"]:
             print(f"  failure_phase      : {METRICS['failure_phase']}")
             print(f"  failure_reason     : {METRICS['failure_reason']}")
-        print(f"  metrics saved to   : task_metrics.json")
-        print(f"  trajectory saved to: task_trajectory.json")
+        print("  metrics saved to   : task_metrics.json")
+        print("  trajectory saved to: task_trajectory.json")
         print("=" * 60)
 
     except KeyboardInterrupt:
@@ -1591,14 +1585,12 @@ def main(task=None, force_color=None, no_reload=False):
             
             # Ensures the simulator always stops, even if the ZMQ socket is broken from the interrupt
             try:
-                _clear_object_selection(sim)
                 sim.stopSimulation()
             except Exception:
                 # The socket is out-of-sync. Spin up a fresh "rescue" client to force the stop.
                 try:
                     rescue_client = RemoteAPIClient()
                     rescue_sim = rescue_client.require("sim")
-                    _clear_object_selection(rescue_sim)
                     rescue_sim.removeObjectFromSelection(rescue_sim.handle_all)
                     rescue_sim.stopSimulation()
                 except Exception as rescue_e:

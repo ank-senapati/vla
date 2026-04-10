@@ -21,6 +21,7 @@ Usage:
   python3 vla_task.py --task "I need to drive screws into the grate."
   python3 vla_task.py --task "I need to place a grate on the base."
   python3 vla_task.py --color red       # bypass LLaVA and force the screwdriver
+    python3 vla_task.py --side-video run_side.mp4
   python3 vla_task.py                   # default: runs both grate + screws demo
 
 Pre-flight:
@@ -68,6 +69,19 @@ SCREW_PUSH_DEPTH = 0.01      # meters to press each screw down
 SCREW_DRIVE_XY_NUDGE = (0.0, 0.01)  # (dX, dY) meters — nudge applied to tip target for screw driving
 IK_SETTLE_ITERS = 20
 IK_SOLVE_ITERS = 100
+
+# ─────────────────────────── Side video config ───────────────
+SIDE_CAM_RES_X = 960
+SIDE_CAM_RES_Y = 540
+SIDE_CAM_FOV_DEG = 85.0
+SIDE_CAM_NEAR = 0.01
+SIDE_CAM_FAR = 10.0
+SIDE_CAM_POS = [1.35, -1.8, 0.8]
+SIDE_CAM_ORI = [-1.885, 0.0, math.pi]
+
+_SIDE_VIDEO_WRITER = None
+_SIDE_VIDEO_SENSOR = None
+_SIDE_VIDEO_PATH = None
 
 # ─── Tip orientation for picking up and placing the grate ───
 # Absolute world-frame Euler angles (α, β, γ) that the user verified in
@@ -189,6 +203,81 @@ def _fail(phase, reason):
 # ─────────────────────────── State container ─────────────────
 class SimState:
     pass
+
+
+def _side_video_start(sim, sensor, filename="side_view.mp4", fps=30):
+    """Start MP4 recording from the side camera vision sensor."""
+    global _SIDE_VIDEO_WRITER, _SIDE_VIDEO_SENSOR, _SIDE_VIDEO_PATH
+    if sensor is None:
+        print("   Side video disabled: no side camera sensor")
+        return
+    fourcc = cv2.VideoWriter_fourcc(*"mp4v")
+    writer = cv2.VideoWriter(
+        filename, fourcc, float(fps), (SIDE_CAM_RES_X, SIDE_CAM_RES_Y)
+    )
+    if not writer.isOpened():
+        print(f"   WARNING: could not open side video writer for '{filename}'")
+        return
+    _SIDE_VIDEO_WRITER = writer
+    _SIDE_VIDEO_SENSOR = sensor
+    _SIDE_VIDEO_PATH = filename
+    print(f"   Side video recording → {_SIDE_VIDEO_PATH}")
+
+
+def _side_video_tick(sim):
+    """Grab one frame from the side camera and append to the MP4."""
+    if _SIDE_VIDEO_WRITER is None or _SIDE_VIDEO_SENSOR is None:
+        return
+    try:
+        img, res = sim.getVisionSensorImg(_SIDE_VIDEO_SENSOR)
+        if not img:
+            return
+        arr = np.frombuffer(img, dtype=np.uint8).reshape((res[1], res[0], 3))
+        arr = cv2.flip(arr, 0)
+        frame_bgr = cv2.cvtColor(arr, cv2.COLOR_RGB2BGR)
+        _SIDE_VIDEO_WRITER.write(frame_bgr)
+    except Exception:
+        pass
+
+
+def _side_video_stop():
+    """Finalize and close side-video writer."""
+    global _SIDE_VIDEO_WRITER, _SIDE_VIDEO_SENSOR, _SIDE_VIDEO_PATH
+    if _SIDE_VIDEO_WRITER is not None:
+        _SIDE_VIDEO_WRITER.release()
+        print(f"   Saved side video: {_SIDE_VIDEO_PATH}")
+    _SIDE_VIDEO_WRITER = None
+    _SIDE_VIDEO_SENSOR = None
+    _SIDE_VIDEO_PATH = None
+
+
+def _create_side_camera(sim):
+    """Create an oblique side camera aimed at the full work area."""
+
+    sensor = sim.createVisionSensor(
+        0,
+        [SIDE_CAM_RES_X, SIDE_CAM_RES_Y, 0, 0],
+        [
+            SIDE_CAM_NEAR,
+            SIDE_CAM_FAR,
+            SIDE_CAM_FOV_DEG * math.pi / 180.0,
+            0.1,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+        ],
+    )
+
+    # Use a fixed, tuned oblique pose that reliably frames UR5 + workspace.
+    sim.setObjectParent(sensor, sim.handle_world, False)
+    sim.setObjectPosition(sensor, sim.handle_world, SIDE_CAM_POS)
+    sim.setObjectOrientation(sensor, sim.handle_world, SIDE_CAM_ORI)
+    sim.setObjectInt32Param(sensor, sim.objintparam_visibility_layer, 0)
+    return sensor
 
 
 def _set_shapes_visibility(sim, shapes, layer):
@@ -433,6 +522,13 @@ def setup_scene(sim, simIK, no_reload=False):
     sim.setObjectInt32Param(vlm_cam, sim.objintparam_visibility_layer, 0)
     st.vlm_camera = vlm_cam
 
+    # Side camera for user-facing task video recording.
+    try:
+        st.side_camera = _create_side_camera(sim)
+    except Exception as e:
+        st.side_camera = None
+        print(f"   (side camera create failed: {e})")
+
     # IK target dummy positioned at the tip so IK starts matched
     st.ik_target = sim.createDummy(0.02)
     tip_pos0 = sim.getObjectPosition(st.tip_dummy, sim.handle_world)
@@ -454,6 +550,11 @@ def setup_scene(sim, simIK, no_reload=False):
     # Target orientation to use for ALL IK solves — preserves the tip's
     # natural upright orientation. Captured before we touch anything.
     st.target_ori = list(tip_ori0)
+    
+    print("UR5 base:", sim.getObjectPosition(st.ur5, sim.handle_world))
+    print("Toolbox:", sim.getObjectPosition(st.toolbox, sim.handle_world))
+    print("Panel:", sim.getObjectPosition(st.panel, sim.handle_world))
+    print("Grate:", sim.getObjectPosition(st.grate, sim.handle_world))
 
     return st
 
@@ -629,6 +730,7 @@ def move_tip_to(st, pos, ori=None, steps=SMOOTH_STEPS_TRANSIT, delay=SMOOTH_DELA
         simIK.handleGroup(st.ik_env, st.ik_group, {"syncWorlds": True})
         simIK.handleGroup(st.ik_env, st.ik_group, {"syncWorlds": True})
 
+        _side_video_tick(sim)
         _traj_record(sim, st.joints)
         time.sleep(delay)
 
@@ -658,6 +760,8 @@ def refine_tip_alignment(st, target_pos, target_ori, label="align",
     ori_err_deg = float("inf")
     for i in range(max_iters):
         simIK.handleGroup(st.ik_env, st.ik_group, {"syncWorlds": True})
+        if i % 2 == 0:
+            _side_video_tick(sim)
         tip_pos = sim.getObjectPosition(st.tip_dummy, sim.handle_world)
         tip_ori = sim.getObjectOrientation(st.tip_dummy, sim.handle_world)
         pos_err = math.sqrt(
@@ -1469,7 +1573,8 @@ def _run_one_task(st, task_description, expected_color=None,
 
 
 # ─────────────────────────── Main ─────────────────────────────
-def main(task=None, force_color=None, no_reload=False):
+def main(task=None, force_color=None, no_reload=False,
+         side_video_path="side_view.mp4", record_side_video=True):
     """Run the task pipeline.
 
     Args:
@@ -1495,10 +1600,16 @@ def main(task=None, force_color=None, no_reload=False):
         time.sleep(0.3)
 
     interrupted = False
+    side_video_started = False
     try:
+        if record_side_video:
+            _side_video_start(sim, getattr(st, "side_camera", None), side_video_path)
+            side_video_started = True
+
         # Let IK settle before capturing home pose
         for _ in range(IK_SETTLE_ITERS):
             simIK.handleGroup(st.ik_env, st.ik_group, {"syncWorlds": True})
+            _side_video_tick(sim)
             time.sleep(0.02)
 
         st.home_config = [sim.getJointPosition(j) for j in st.joints]
@@ -1633,6 +1744,9 @@ def main(task=None, force_color=None, no_reload=False):
         print("!" * 60 + "\n")
 
     finally:
+        if side_video_started:
+            _side_video_stop()
+
         # Determine if we should force a stop. We stop if interrupted, OR if it's the default full demo.
         should_stop = interrupted or (task is None and force_color is None)
 
@@ -1697,6 +1811,24 @@ if __name__ == "__main__":
              "Use this for the second task in a chain: first run places "
              "the grate, second run (with --no-reload) drives screws.",
     )
+    parser.add_argument(
+        "--side-video",
+        type=str,
+        default="side_view.mp4",
+        help="Path to MP4 side-view recording output."
+             " Default: side_view.mp4",
+    )
+    parser.add_argument(
+        "--no-side-video",
+        action="store_true",
+        help="Disable side-view MP4 recording.",
+    )
     args = parser.parse_args()
 
-    main(task=args.task, force_color=args.color, no_reload=args.no_reload)
+    main(
+        task=args.task,
+        force_color=args.color,
+        no_reload=args.no_reload,
+        side_video_path=args.side_video,
+        record_side_video=(not args.no_side_video),
+    )

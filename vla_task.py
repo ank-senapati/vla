@@ -37,6 +37,7 @@ import argparse
 import cv2
 import numpy as np
 import ollama
+import psutil
 from coppeliasim_zmqremoteapi_client import RemoteAPIClient
 
 # Reuse utilities from vla.py
@@ -125,15 +126,51 @@ COLOR_TO_TOOL_KEY = {
 # ─────────────────────────── Metrics ──────────────────────────
 METRICS = {
     "vlm_tool_selections": [],
+    "vlm_calls": [],          # per-call wall-time, peak RSS, reply text
     "position_errors_mm": [],
     "orientation_errors_deg": [],
-    "pose_errors": [],   # combined position+orientation per alignment phase
+    "pose_errors": [],        # combined position+orientation per alignment phase
+    "screw_seating": [],      # per-screw: driven travel vs intended SCREW_PUSH_DEPTH
+    "ik_convergence": [],     # per-refine_tip_alignment call: wall-time, iters, converged
     "phase_timings_sec": {},
     "task_success": False,
     "failure_phase": None,
     "failure_reason": None,
 }
+_PROCESS = psutil.Process(os.getpid())
+
+
+def _find_ollama_processes():
+    """Return list of psutil.Process objects for the `ollama` server/runner
+    so we can measure the LLM's actual RSS, not our Python client's. Covers
+    `ollama serve`, `ollama runner`, and any llama.cpp subprocess it spawns.
+    """
+    procs = []
+    for p in psutil.process_iter(["name", "cmdline"]):
+        try:
+            name = (p.info.get("name") or "").lower()
+            cmd = " ".join(p.info.get("cmdline") or []).lower()
+            if "ollama" in name or "ollama" in cmd:
+                procs.append(p)
+        except (psutil.NoSuchProcess, psutil.AccessDenied):
+            continue
+    return procs
+
+
+def _ollama_rss_mb():
+    """Sum RSS (in MB) across all ollama-related processes. This is a
+    reasonable proxy for the LLM's resident memory. Returns 0.0 if
+    ollama isn't running."""
+    total = 0
+    for p in _find_ollama_processes():
+        try:
+            total += p.memory_info().rss
+        except (psutil.NoSuchProcess, psutil.AccessDenied):
+            continue
+    return total / (1024 * 1024)
 _phase_start = {}
+_vlm_last_latency_sec = 0.0
+_vlm_last_peak_rss_mb = 0.0
 
 
 def _begin_phase(name):
@@ -772,6 +809,9 @@ def refine_tip_alignment(st, target_pos, target_ori, label="align",
 
     pos_err = float("inf")
     ori_err_deg = float("inf")
+    converged = False
+    iters_used = max_iters
+    t_ik0 = time.perf_counter()
     for i in range(max_iters):
         simIK.handleGroup(st.ik_env, st.ik_group, {"syncWorlds": True})
         if i % 2 == 0:
@@ -786,9 +826,23 @@ def refine_tip_alignment(st, target_pos, target_ori, label="align",
         )
         ori_err_deg = math.degrees(ori_err_rad)
         if pos_err <= pos_tol_m and ori_err_deg <= ori_tol_deg:
-            print(f"   [{label}] IK converged in {i + 1} iters: "
+            converged = True
+            iters_used = i + 1
+            print(f"   [{label}] IK converged in {iters_used} iters: "
                   f"pos={pos_err * 1000:.2f} mm  ori={ori_err_deg:.2f}°")
-            return True
+            break
+
+    ik_wall_sec = time.perf_counter() - t_ik0
+    METRICS["ik_convergence"].append({
+        "label": label,
+        "converged": converged,
+        "iters": iters_used,
+        "final_pos_err_mm": round(pos_err * 1000, 3),
+        "final_ori_err_deg": round(ori_err_deg, 3),
+        "wall_sec": round(ik_wall_sec, 4),
+    })
+    if converged:
+        return True
 
     print(f"   [{label}] !! IK did NOT reach tolerance after {max_iters} iters: "
           f"pos={pos_err * 1000:.2f} mm  ori={ori_err_deg:.2f}°")
@@ -1395,6 +1449,7 @@ def drive_screw(st, screw_handle, idx):
                     descend_pos, tip_ori, tip_world_pos, tip_world_ori)
 
     # ── 6. Parent the screw ──
+    screw_pre_parent = list(sim.getObjectPosition(screw_handle, sim.handle_world))
     sim.setObjectParent(screw_handle, st.tip_dummy, True)
     try:
         sim.resetDynamicObject(screw_handle)
@@ -1406,7 +1461,26 @@ def drive_screw(st, screw_handle, idx):
                   screw_pos[2] + SCREW_DRIVE_Z_OFFSET - SCREW_PUSH_DEPTH]
     move_tip_to(st, pushed_pos, ori=tip_ori, steps=60)
     screw_final = list(sim.getObjectPosition(screw_handle, sim.handle_world))
-    _log_position_error(f"drive_screw_{idx}_pushed", pushed_pos, screw_final)
+    # Screw seating metric: log the actual vertical travel of the screw
+    # against the intended push depth. Previously this was (mistakenly)
+    # compared to the tip target Z, which produced a meaningless ~11 cm
+    # "error" when the screw had simply settled into its hole.
+    travel_z_mm = abs(screw_pre_parent[2] - screw_final[2]) * 1000.0
+    intended_mm = SCREW_PUSH_DEPTH * 1000.0
+    tip_after = list(sim.getObjectPosition(st.tip_dummy, sim.handle_world))
+    tip_tracking_mm = math.sqrt(
+        sum((tip_after[k] - pushed_pos[k]) ** 2 for k in range(3))
+    ) * 1000.0
+    METRICS["screw_seating"].append({
+        "phase": f"drive_screw_{idx}_seating",
+        "screw_initial_xyz": [float(v) for v in screw_pre_parent],
+        "screw_final_xyz": [float(v) for v in screw_final],
+        "travel_z_mm": round(travel_z_mm, 2),
+        "intended_travel_mm": round(intended_mm, 2),
+        "tip_tracking_error_mm": round(tip_tracking_mm, 2),
+    })
+    print(f"   [drive_screw_{idx}_seating] screw travel Z = {travel_z_mm:.1f} mm "
+          f"(intended {intended_mm:.1f} mm)  tip-tracking = {tip_tracking_mm:.2f} mm")
 
     # ── 8. Release ──
     sim.setObjectParent(screw_handle, -1, True)
@@ -1446,12 +1520,21 @@ def query_vlm(st, task_description, expected_color=None):
     --task input where we don't know the right answer in advance)."""
     fname = f"vlm_view_{len(METRICS['vlm_tool_selections'])}.jpg"
     img = capture_vlm_image(st, fname)
+    global _vlm_last_latency_sec, _vlm_last_peak_rss_mb
+    _vlm_last_latency_sec = 0.0
+    _vlm_last_peak_rss_mb = 0.0
     if img is None:
         print("   VLM: failed to capture image")
         got = None
         reply = ""
     else:
         prompt = VLM_PROMPT_TEMPLATE.format(task=task_description)
+        # Measure the ollama server's RSS (the actual LLM memory), not
+        # this Python client's. Sample before, during (mid-call is
+        # approximated by sampling right after the response arrives while
+        # the model is still resident), and take the max.
+        rss_before_mb = _ollama_rss_mb()
+        t0 = time.perf_counter()
         try:
             r = ollama.chat(
                 model=VLM_MODEL,
@@ -1461,6 +1544,12 @@ def query_vlm(st, task_description, expected_color=None):
         except Exception as e:
             print(f"   Ollama error: {e}")
             reply = ""
+        _vlm_last_latency_sec = time.perf_counter() - t0
+        rss_after_mb = _ollama_rss_mb()
+        _vlm_last_peak_rss_mb = max(rss_before_mb, rss_after_mb)
+        print(f"   VLM latency: {_vlm_last_latency_sec:.2f}s  "
+              f"ollama RSS: {_vlm_last_peak_rss_mb:.0f} MB "
+              f"(client RSS: {_PROCESS.memory_info().rss / (1024*1024):.0f} MB)")
         got = None
         for c in ("red", "green", "blue"):
             if c in reply:
@@ -1475,6 +1564,13 @@ def query_vlm(st, task_description, expected_color=None):
         "raw_reply": reply[:200],
         "correct": correct,
         "image": fname,
+        "latency_sec": round(_vlm_last_latency_sec, 3),
+        "peak_rss_mb": round(_vlm_last_peak_rss_mb, 1),
+    })
+    METRICS["vlm_calls"].append({
+        "task": task_description,
+        "latency_sec": round(_vlm_last_latency_sec, 3),
+        "peak_rss_mb": round(_vlm_last_peak_rss_mb, 1),
     })
     print(f"   VLM: task='{task_description[:60]}'")
     if expected_color is None:

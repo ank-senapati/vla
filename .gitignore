@@ -11,3 +11,11 @@ venv/
 # OS
 .DS_Store
 Thumbs.db
+
+# Run artifacts (regenerated on each run)
+side_view.mp4
+*.json
+vlm_view_*.jpg
+
+# Papers / references
+AIAA_COSMIC.pdf
